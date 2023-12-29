@@ -25,4 +25,4 @@ from __future__ import absolute_import, division, print_function
 # or negative for a release candidate or beta (after the base version
 # number has been incremented)
 version = "5.1.1"
-version_info = (5, 1, 1, 0)
+version_info = (5, 1, 1, 1)

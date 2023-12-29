@@ -1,0 +1,11 @@
+What's new in Tornado 5.1.1.1
+=============================
+
+Dec 29 12, 2023
+---------------
+
+Security improvements
+~~~~~~~~~~~~~~~~~~~~~
+
+- Fixed an open redirect vulnerability in StaticFileHandler under certain
+  configurations.
