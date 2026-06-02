@@ -71,6 +71,12 @@ except ImportError:
 # terminator and ignore any preceding CR.
 _CRLF_RE = re.compile(r'\r?\n')
 
+# RFC 7230 section 3.2.3: only space and horizontal tab are valid optional
+# whitespace around header values. Stripping arbitrary unicode whitespace
+# (as bare str.strip() does) lets values containing e.g. \x85/\xa0 disagree
+# with a proxy's parsing and enables request smuggling (GHSA-753j-mpmx-qq6g).
+HTTP_WHITESPACE = " \t"
+
 
 class _NormalizedHeaderCache(dict):
     """Dynamic cached mapping of header names to Http-Header-Case.
@@ -187,7 +193,7 @@ class HTTPHeaders(collections.MutableMapping):
             # continuation of a multi-line header
             if self._last_key is None:
                 raise HTTPInputError("first header line cannot start with whitespace")
-            new_part = ' ' + line.lstrip()
+            new_part = ' ' + line.lstrip(HTTP_WHITESPACE)
             self._as_list[self._last_key][-1] += new_part
             self._dict[self._last_key] += new_part
         else:
@@ -195,7 +201,7 @@ class HTTPHeaders(collections.MutableMapping):
                 name, value = line.split(":", 1)
             except ValueError:
                 raise HTTPInputError("no colon in header line")
-            self.add(name, value.strip())
+            self.add(name, value.strip(HTTP_WHITESPACE))
 
     @classmethod
     def parse(cls, headers):

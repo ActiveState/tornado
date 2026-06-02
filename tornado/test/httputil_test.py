@@ -305,6 +305,20 @@ Foo: even
         data = " Foo: bar"
         self.assertRaises(HTTPInputError, HTTPHeaders.parse, data)
 
+    def test_optional_whitespace_stripping(self):
+        # GHSA-753j-mpmx-qq6g: only spaces and tabs (RFC 7230 OWS) are
+        # stripped from a header value -- not arbitrary unicode/control
+        # whitespace, which a proxy would keep and which could otherwise
+        # enable request smuggling.
+        h = HTTPHeaders()
+        h.parse_line("Foo: \t bar baz \t")
+        self.assertEqual(h["Foo"], "bar baz")
+
+        h2 = HTTPHeaders()
+        # A vertical tab is not OWS, so it stays part of the value.
+        h2.parse_line("Foo: \x0bbar")
+        self.assertEqual(h2["Foo"], "\x0bbar")
+
     def test_unicode_newlines(self):
         # Ensure that only \r\n is recognized as a header separator, and not
         # the other newline-like unicode characters.

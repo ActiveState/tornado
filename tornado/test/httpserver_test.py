@@ -475,6 +475,37 @@ bar
             yield self.stream.read_until_close()
 
     @gen_test
+    def test_duplicate_transfer_encoding(self):
+        # GHSA-753j-mpmx-qq6g: a duplicated Transfer-Encoding header collapses
+        # to "chunked,chunked", which must be rejected rather than silently
+        # treated as chunked (front-end/back-end disagreement = smuggling).
+        with ExpectLog(gen_log, '.*Unsupported Transfer-Encoding'):
+            self.stream.write(b"""\
+POST /echo HTTP/1.1
+Transfer-Encoding: chunked
+Transfer-Encoding: chunked
+
+0
+
+""".replace(b"\n", b"\r\n"))
+            yield self.stream.read_until_close()
+
+    @gen_test
+    def test_transfer_encoding_and_content_length(self):
+        # GHSA-753j-mpmx-qq6g: a message with both Transfer-Encoding and
+        # Content-Length is ambiguous and must be rejected.
+        with ExpectLog(gen_log, '.*both Transfer-Encoding and Content-Length'):
+            self.stream.write(b"""\
+POST /echo HTTP/1.1
+Transfer-Encoding: chunked
+Content-Length: 2
+
+0
+
+""".replace(b"\n", b"\r\n"))
+            yield self.stream.read_until_close()
+
+    @gen_test
     def test_lenient_content_length_rejected(self):
         # GHSA-qppv-j76h-2rpx: Content-Length values that Python's int()
         # accepts but a proxy would not (leading +, underscores) must be

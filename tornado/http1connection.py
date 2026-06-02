@@ -59,6 +59,28 @@ def parse_hex_int(s):
     return int(s, 16)
 
 
+def is_transfer_encoding_chunked(headers):
+    """Returns true if the headers specify Transfer-Encoding: chunked.
+
+    Raises httputil.HTTPInputError if any other transfer-encoding is used,
+    if both Transfer-Encoding and Content-Length are present, or if a
+    duplicated header makes the value something other than exactly
+    "chunked" (e.g. "chunked,chunked"). This prevents the front-end/back-end
+    disagreement that enables request smuggling (GHSA-753j-mpmx-qq6g).
+    """
+    if "Transfer-Encoding" not in headers:
+        return False
+    if "Content-Length" in headers:
+        # Message cannot contain both Content-Length and Transfer-Encoding.
+        # http://tools.ietf.org/html/rfc7230#section-3.3.3
+        raise httputil.HTTPInputError(
+            "Message with both Transfer-Encoding and Content-Length")
+    if headers["Transfer-Encoding"].lower() == "chunked":
+        return True
+    raise httputil.HTTPInputError(
+        "Unsupported Transfer-Encoding %s" % headers["Transfer-Encoding"])
+
+
 class _QuietException(Exception):
     def __init__(self):
         pass
@@ -529,7 +551,7 @@ class HTTP1Connection(httputil.HTTPConnection):
         if start_line.version == "HTTP/1.1":
             return connection_header != "close"
         elif ("Content-Length" in headers or
-              headers.get("Transfer-Encoding", "").lower() == "chunked" or
+              is_transfer_encoding_chunked(headers) or
               getattr(start_line, 'method', None) in ("HEAD", "GET")):
             # start_line may be a request or response start line; only
             # the former has a method attribute.
@@ -561,12 +583,6 @@ class HTTP1Connection(httputil.HTTPConnection):
 
     def _read_body(self, code, headers, delegate):
         if "Content-Length" in headers:
-            if "Transfer-Encoding" in headers:
-                # Response cannot contain both Content-Length and
-                # Transfer-Encoding headers.
-                # http://tools.ietf.org/html/rfc7230#section-3.3.3
-                raise httputil.HTTPInputError(
-                    "Response with both Transfer-Encoding and Content-Length")
             if "," in headers["Content-Length"]:
                 # Proxies sometimes cause Content-Length headers to get
                 # duplicated.  If all the values are identical then we can
@@ -590,20 +606,21 @@ class HTTP1Connection(httputil.HTTPConnection):
         else:
             content_length = None
 
+        is_chunked = is_transfer_encoding_chunked(headers)
+
         if code == 204:
             # This response code is not allowed to have a non-empty body,
             # and has an implicit length of zero instead of read-until-close.
             # http://www.w3.org/Protocols/rfc2616/rfc2616-sec4.html#sec4.3
-            if ("Transfer-Encoding" in headers or
-                    content_length not in (None, 0)):
+            if is_chunked or content_length not in (None, 0):
                 raise httputil.HTTPInputError(
                     "Response with code %d should not have body" % code)
             content_length = 0
 
+        if is_chunked:
+            return self._read_chunked_body(delegate)
         if content_length is not None:
             return self._read_fixed_body(content_length, delegate)
-        if headers.get("Transfer-Encoding", "").lower() == "chunked":
-            return self._read_chunked_body(delegate)
         if self.is_client:
             return self._read_body_until_close(delegate)
         return None
