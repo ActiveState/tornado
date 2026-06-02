@@ -44,6 +44,11 @@ from tornado.util import GzipDecompressor, PY3
 _CONTENT_LENGTH_RE = re.compile(r"[0-9]+\Z")
 _CHUNK_LENGTH_RE = re.compile(r"[0-9a-fA-F]+\Z")
 
+# A header line containing a bare CR or LF can be used to inject additional
+# headers or smuggle a second request (GHSA-w235-7p84-xx57). Operates on the
+# already-encoded (bytes) header lines.
+_CR_OR_LF_RE = re.compile(b"\r|\n")
+
 
 def parse_int(s):
     """Parse a non-negative integer from a string, strictly (digits only)."""
@@ -441,8 +446,8 @@ class HTTP1Connection(httputil.HTTPConnection):
         else:
             lines.extend(header_lines)
         for line in lines:
-            if b'\n' in line:
-                raise ValueError('Newline in header: ' + repr(line))
+            if _CR_OR_LF_RE.search(line):
+                raise ValueError('Illegal characters (CR or LF) in header: ' + repr(line))
         future = None
         if self.stream.closed():
             future = self._write_future = Future()

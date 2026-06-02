@@ -521,6 +521,18 @@ bar
             yield self.stream.read_until_close()
 
 
+class HeaderCRLFRejectionTest(unittest.TestCase):
+    # GHSA-w235-7p84-xx57: an (encoded) header line containing a bare CR or LF
+    # must be detected so it can be rejected before reaching the wire/libcurl.
+    def test_cr_or_lf_detected(self):
+        from tornado.http1connection import _CR_OR_LF_RE
+        for bad in [b"X-Foo: a\rb", b"X-Foo: a\nb", b"X-Foo: a\r\nb",
+                    b"a\rb: v", b"a\nb: v"]:
+            self.assertIsNotNone(_CR_OR_LF_RE.search(bad), bad)
+        for ok in [b"X-Foo: bar", b"Content-Length: 0", b"", b"X-Foo: a b"]:
+            self.assertIsNone(_CR_OR_LF_RE.search(ok), ok)
+
+
 class StrictIntParsingTest(unittest.TestCase):
     # GHSA-qppv-j76h-2rpx: Content-Length and chunk sizes must be parsed
     # strictly (digits only), unlike Python's lenient int().

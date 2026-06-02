@@ -21,6 +21,7 @@ import collections
 import functools
 import logging
 import pycurl  # type: ignore
+import re
 import threading
 import time
 from io import BytesIO
@@ -30,6 +31,11 @@ from tornado import ioloop
 from tornado import stack_context
 
 from tornado.escape import utf8, native_str
+
+# libcurl does not validate header values, so a CR or LF smuggled into a
+# header name or value would inject extra headers or a second request
+# (GHSA-w235-7p84-xx57). Reject them before handing headers to libcurl.
+_CR_OR_LF_RE = re.compile(b"\r|\n")
 from tornado.httpclient import HTTPResponse, HTTPError, AsyncHTTPClient, main
 
 curl_log = logging.getLogger('tornado.curl_httpclient')
@@ -310,9 +316,15 @@ class CurlAsyncHTTPClient(AsyncHTTPClient):
         if "Pragma" not in request.headers:
             request.headers["Pragma"] = ""
 
-        curl.setopt(pycurl.HTTPHEADER,
-                    ["%s: %s" % (native_str(k), native_str(v))
-                     for k, v in request.headers.get_all()])
+        encoded_headers = [
+            utf8("%s: %s" % (native_str(k), native_str(v)))
+            for k, v in request.headers.get_all()
+        ]
+        for line in encoded_headers:
+            if _CR_OR_LF_RE.search(line):
+                raise ValueError(
+                    "Illegal characters (CR or LF) in header: %r" % line)
+        curl.setopt(pycurl.HTTPHEADER, encoded_headers)
 
         curl.setopt(pycurl.HEADERFUNCTION,
                     functools.partial(self._curl_header_callback,
