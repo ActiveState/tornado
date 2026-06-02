@@ -474,6 +474,83 @@ bar
 """.replace(b"\n", b"\r\n"))
             yield self.stream.read_until_close()
 
+    @gen_test
+    def test_duplicate_transfer_encoding(self):
+        # GHSA-753j-mpmx-qq6g: a duplicated Transfer-Encoding header collapses
+        # to "chunked,chunked", which must be rejected rather than silently
+        # treated as chunked (front-end/back-end disagreement = smuggling).
+        with ExpectLog(gen_log, '.*Unsupported Transfer-Encoding'):
+            self.stream.write(b"""\
+POST /echo HTTP/1.1
+Transfer-Encoding: chunked
+Transfer-Encoding: chunked
+
+0
+
+""".replace(b"\n", b"\r\n"))
+            yield self.stream.read_until_close()
+
+    @gen_test
+    def test_transfer_encoding_and_content_length(self):
+        # GHSA-753j-mpmx-qq6g: a message with both Transfer-Encoding and
+        # Content-Length is ambiguous and must be rejected.
+        with ExpectLog(gen_log, '.*both Transfer-Encoding and Content-Length'):
+            self.stream.write(b"""\
+POST /echo HTTP/1.1
+Transfer-Encoding: chunked
+Content-Length: 2
+
+0
+
+""".replace(b"\n", b"\r\n"))
+            yield self.stream.read_until_close()
+
+    @gen_test
+    def test_lenient_content_length_rejected(self):
+        # GHSA-qppv-j76h-2rpx: Content-Length values that Python's int()
+        # accepts but a proxy would not (leading +, underscores) must be
+        # rejected to avoid request smuggling.
+        with ExpectLog(gen_log, '.*Only integer Content-Length is allowed'):
+            self.stream.write(b"""\
+POST /echo HTTP/1.1
+Content-Length: +10
+
+bar
+
+""".replace(b"\n", b"\r\n"))
+            yield self.stream.read_until_close()
+
+
+class HeaderCRLFRejectionTest(unittest.TestCase):
+    # GHSA-w235-7p84-xx57: an (encoded) header line containing a bare CR or LF
+    # must be detected so it can be rejected before reaching the wire/libcurl.
+    def test_cr_or_lf_detected(self):
+        from tornado.http1connection import _CR_OR_LF_RE
+        for bad in [b"X-Foo: a\rb", b"X-Foo: a\nb", b"X-Foo: a\r\nb",
+                    b"a\rb: v", b"a\nb: v"]:
+            self.assertIsNotNone(_CR_OR_LF_RE.search(bad), bad)
+        for ok in [b"X-Foo: bar", b"Content-Length: 0", b"", b"X-Foo: a b"]:
+            self.assertIsNone(_CR_OR_LF_RE.search(ok), ok)
+
+
+class StrictIntParsingTest(unittest.TestCase):
+    # GHSA-qppv-j76h-2rpx: Content-Length and chunk sizes must be parsed
+    # strictly (digits only), unlike Python's lenient int().
+    def test_parse_int(self):
+        from tornado.http1connection import parse_int
+        self.assertEqual(parse_int("10"), 10)
+        self.assertEqual(parse_int("0"), 0)
+        for bad in ["+10", "-10", "1_0", " 10", "10 ", "0x10", "10\n", "", "0b1", "1.0"]:
+            self.assertRaises(ValueError, parse_int, bad)
+
+    def test_parse_hex_int(self):
+        from tornado.http1connection import parse_hex_int
+        self.assertEqual(parse_hex_int("a"), 10)
+        self.assertEqual(parse_hex_int("FF"), 255)
+        self.assertEqual(parse_hex_int("0"), 0)
+        for bad in ["+a", "-a", "1_a", " a", "a ", "0xa", "a\n", "", "g", "1.0"]:
+            self.assertRaises(ValueError, parse_hex_int, bad)
+
 
 class XHeaderTest(HandlerBaseTestCase):
     class Handler(RequestHandler):

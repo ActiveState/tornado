@@ -761,7 +761,7 @@ class ChunkedWithContentLengthTest(AsyncHTTPTestCase):
 
     def test_chunked_with_content_length(self):
         # Make sure the invalid headers are detected
-        with ExpectLog(gen_log, ("Malformed HTTP message from None: Response "
+        with ExpectLog(gen_log, ("Malformed HTTP message from None: Message "
                                  "with both Transfer-Encoding and Content-Length")):
             with self.assertRaises(HTTPStreamClosedError):
                 self.fetch('/chunkwithcl', raise_error=True)

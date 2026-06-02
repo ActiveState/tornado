@@ -34,6 +34,58 @@ from tornado import stack_context
 from tornado.util import GzipDecompressor, PY3
 
 
+# RFC 7230 section 3.3.2: Content-Length is a sequence of digits, and
+# RFC 7230 section 4.1: chunk-size is a sequence of hex digits. Python's
+# int() is more lenient (it accepts leading "+", surrounding whitespace, and
+# underscores on 3.6+), which can desync Tornado from a front-end proxy and
+# enable request smuggling. Parse them strictly instead.
+# NOTE: re.fullmatch / str.fullmatch are unavailable on Python 2.7, so anchor
+# with \Z (not $, which also matches a trailing newline).
+_CONTENT_LENGTH_RE = re.compile(r"[0-9]+\Z")
+_CHUNK_LENGTH_RE = re.compile(r"[0-9a-fA-F]+\Z")
+
+# A header line containing a bare CR or LF can be used to inject additional
+# headers or smuggle a second request (GHSA-w235-7p84-xx57). Operates on the
+# already-encoded (bytes) header lines.
+_CR_OR_LF_RE = re.compile(b"\r|\n")
+
+
+def parse_int(s):
+    """Parse a non-negative integer from a string, strictly (digits only)."""
+    if _CONTENT_LENGTH_RE.match(s) is None:
+        raise ValueError("not an integer: %r" % s)
+    return int(s)
+
+
+def parse_hex_int(s):
+    """Parse a non-negative hexadecimal integer from a string, strictly."""
+    if _CHUNK_LENGTH_RE.match(s) is None:
+        raise ValueError("not a hexadecimal integer: %r" % s)
+    return int(s, 16)
+
+
+def is_transfer_encoding_chunked(headers):
+    """Returns true if the headers specify Transfer-Encoding: chunked.
+
+    Raises httputil.HTTPInputError if any other transfer-encoding is used,
+    if both Transfer-Encoding and Content-Length are present, or if a
+    duplicated header makes the value something other than exactly
+    "chunked" (e.g. "chunked,chunked"). This prevents the front-end/back-end
+    disagreement that enables request smuggling (GHSA-753j-mpmx-qq6g).
+    """
+    if "Transfer-Encoding" not in headers:
+        return False
+    if "Content-Length" in headers:
+        # Message cannot contain both Content-Length and Transfer-Encoding.
+        # http://tools.ietf.org/html/rfc7230#section-3.3.3
+        raise httputil.HTTPInputError(
+            "Message with both Transfer-Encoding and Content-Length")
+    if headers["Transfer-Encoding"].lower() == "chunked":
+        return True
+    raise httputil.HTTPInputError(
+        "Unsupported Transfer-Encoding %s" % headers["Transfer-Encoding"])
+
+
 class _QuietException(Exception):
     def __init__(self):
         pass
@@ -381,7 +433,8 @@ class HTTP1Connection(httputil.HTTPConnection):
              start_line.code == 304)):
             self._expected_content_remaining = 0
         elif 'Content-Length' in headers:
-            self._expected_content_remaining = int(headers['Content-Length'])
+            self._expected_content_remaining = parse_int(
+                native_str(headers['Content-Length']))
         else:
             self._expected_content_remaining = None
         # TODO: headers are supposed to be of type str, but we still have some
@@ -393,8 +446,8 @@ class HTTP1Connection(httputil.HTTPConnection):
         else:
             lines.extend(header_lines)
         for line in lines:
-            if b'\n' in line:
-                raise ValueError('Newline in header: ' + repr(line))
+            if _CR_OR_LF_RE.search(line):
+                raise ValueError('Illegal characters (CR or LF) in header: ' + repr(line))
         future = None
         if self.stream.closed():
             future = self._write_future = Future()
@@ -503,7 +556,7 @@ class HTTP1Connection(httputil.HTTPConnection):
         if start_line.version == "HTTP/1.1":
             return connection_header != "close"
         elif ("Content-Length" in headers or
-              headers.get("Transfer-Encoding", "").lower() == "chunked" or
+              is_transfer_encoding_chunked(headers) or
               getattr(start_line, 'method', None) in ("HEAD", "GET")):
             # start_line may be a request or response start line; only
             # the former has a method attribute.
@@ -535,12 +588,6 @@ class HTTP1Connection(httputil.HTTPConnection):
 
     def _read_body(self, code, headers, delegate):
         if "Content-Length" in headers:
-            if "Transfer-Encoding" in headers:
-                # Response cannot contain both Content-Length and
-                # Transfer-Encoding headers.
-                # http://tools.ietf.org/html/rfc7230#section-3.3.3
-                raise httputil.HTTPInputError(
-                    "Response with both Transfer-Encoding and Content-Length")
             if "," in headers["Content-Length"]:
                 # Proxies sometimes cause Content-Length headers to get
                 # duplicated.  If all the values are identical then we can
@@ -553,7 +600,7 @@ class HTTP1Connection(httputil.HTTPConnection):
                 headers["Content-Length"] = pieces[0]
 
             try:
-                content_length = int(headers["Content-Length"])
+                content_length = parse_int(native_str(headers["Content-Length"]))
             except ValueError:
                 # Handles non-integer Content-Length value.
                 raise httputil.HTTPInputError(
@@ -564,20 +611,21 @@ class HTTP1Connection(httputil.HTTPConnection):
         else:
             content_length = None
 
+        is_chunked = is_transfer_encoding_chunked(headers)
+
         if code == 204:
             # This response code is not allowed to have a non-empty body,
             # and has an implicit length of zero instead of read-until-close.
             # http://www.w3.org/Protocols/rfc2616/rfc2616-sec4.html#sec4.3
-            if ("Transfer-Encoding" in headers or
-                    content_length not in (None, 0)):
+            if is_chunked or content_length not in (None, 0):
                 raise httputil.HTTPInputError(
                     "Response with code %d should not have body" % code)
             content_length = 0
 
+        if is_chunked:
+            return self._read_chunked_body(delegate)
         if content_length is not None:
             return self._read_fixed_body(content_length, delegate)
-        if headers.get("Transfer-Encoding", "").lower() == "chunked":
-            return self._read_chunked_body(delegate)
         if self.is_client:
             return self._read_body_until_close(delegate)
         return None
@@ -600,7 +648,10 @@ class HTTP1Connection(httputil.HTTPConnection):
         total_size = 0
         while True:
             chunk_len = yield self.stream.read_until(b"\r\n", max_bytes=64)
-            chunk_len = int(chunk_len.strip(), 16)
+            try:
+                chunk_len = parse_hex_int(native_str(chunk_len[:-2]))
+            except ValueError:
+                raise httputil.HTTPInputError("invalid chunk size")
             if chunk_len == 0:
                 crlf = yield self.stream.read_bytes(2)
                 if crlf != b'\r\n':

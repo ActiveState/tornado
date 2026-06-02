@@ -4,7 +4,7 @@ from __future__ import absolute_import, division, print_function
 from tornado.httputil import (
     url_concat, parse_multipart_form_data, HTTPHeaders, format_timestamp,
     HTTPServerRequest, parse_request_start_line, parse_cookie, qs_to_qsl,
-    HTTPInputError,
+    HTTPInputError, _MULTIPART_MAX_PARTS, _MULTIPART_MAX_PART_HEADER_SIZE,
 )
 from tornado.escape import utf8, native_str
 from tornado.util import PY3
@@ -212,9 +212,25 @@ Foo
 --1234--'''.replace(b"\n", b"\r\n")
         args = {}
         files = {}
-        with ExpectLog(gen_log, "multipart/form-data missing headers"):
+        with self.assertRaises(HTTPInputError):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
+
+    def test_too_many_parts(self):
+        # CVE-2026-31958: a body with a very large number of parts must be
+        # rejected rather than parsed (which would block the event loop).
+        part = (b"--1234\r\nContent-Disposition: form-data; name=a\r\n"
+                b"\r\nv\r\n")
+        data = part * (_MULTIPART_MAX_PARTS + 1) + b"--1234--"
+        with self.assertRaises(HTTPInputError):
+            parse_multipart_form_data(b"1234", data, {}, {})
+
+    def test_part_headers_too_large(self):
+        # CVE-2026-31958: an enormous per-part header block must be rejected.
+        big_header = b"X-Bad: " + b"a" * (_MULTIPART_MAX_PART_HEADER_SIZE + 1)
+        data = b"--1234\r\n" + big_header + b"\r\n\r\nv\r\n--1234--"
+        with self.assertRaises(HTTPInputError):
+            parse_multipart_form_data(b"1234", data, {}, {})
 
     def test_invalid_content_disposition(self):
         data = b'''\
@@ -225,7 +241,7 @@ Foo
 --1234--'''.replace(b"\n", b"\r\n")
         args = {}
         files = {}
-        with ExpectLog(gen_log, "Invalid multipart/form-data"):
+        with self.assertRaises(HTTPInputError):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
 
@@ -237,7 +253,7 @@ Content-Disposition: form-data; name="files"; filename="ab.txt"
 Foo--1234--'''.replace(b"\n", b"\r\n")
         args = {}
         files = {}
-        with ExpectLog(gen_log, "Invalid multipart/form-data"):
+        with self.assertRaises(HTTPInputError):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
 
@@ -250,7 +266,7 @@ Foo
 --1234--""".replace(b"\n", b"\r\n")
         args = {}
         files = {}
-        with ExpectLog(gen_log, "multipart/form-data value missing name"):
+        with self.assertRaises(HTTPInputError):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
 
@@ -304,6 +320,20 @@ Foo: even
         # (with a proper error).
         data = " Foo: bar"
         self.assertRaises(HTTPInputError, HTTPHeaders.parse, data)
+
+    def test_optional_whitespace_stripping(self):
+        # GHSA-753j-mpmx-qq6g: only spaces and tabs (RFC 7230 OWS) are
+        # stripped from a header value -- not arbitrary unicode/control
+        # whitespace, which a proxy would keep and which could otherwise
+        # enable request smuggling.
+        h = HTTPHeaders()
+        h.parse_line("Foo: \t bar baz \t")
+        self.assertEqual(h["Foo"], "bar baz")
+
+        h2 = HTTPHeaders()
+        # A vertical tab is not OWS, so it stays part of the value.
+        h2.parse_line("Foo: \x0bbar")
+        self.assertEqual(h2["Foo"], "\x0bbar")
 
     def test_unicode_newlines(self):
         # Ensure that only \r\n is recognized as a header separator, and not
@@ -514,3 +544,23 @@ class ParseCookieTest(unittest.TestCase):
         # but parse_cookie() should parse whitespace the same way
         # document.cookie parses whitespace.
         self.assertEqual(parse_cookie('  =  b  ;  ;  =  ;   c  =  ;  '), {'': 'b', 'c': ''})
+
+    def test_unquote(self):
+        from tornado.httputil import _unquote_cookie
+        self.assertEqual(_unquote_cookie(None), None)
+        self.assertEqual(_unquote_cookie('foo'), 'foo')
+        self.assertEqual(_unquote_cookie('"foo"'), 'foo')
+        self.assertEqual(_unquote_cookie(r'"\""'), '"')
+        self.assertEqual(_unquote_cookie(r'"\134"'), '\\')
+        self.assertEqual(_unquote_cookie(r'"\012"'), '\n')
+
+    def test_unquote_large(self):
+        # CVE-2024-52804: unquoting a long quoted value full of escapes must
+        # not take quadratic time. The old char-by-char loop would take many
+        # seconds (effectively a DoS); the regex implementation is near-instant.
+        from tornado.httputil import _unquote_cookie
+        n = 100000
+        start = time.time()
+        value = _unquote_cookie('"' + '\\134' * n + '"')
+        self.assertEqual(value, '\\' * n)
+        self.assertLess(time.time() - start, 5.0)

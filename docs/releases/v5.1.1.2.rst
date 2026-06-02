@@ -1,0 +1,45 @@
+What's new in Tornado 5.1.1+security.2
+======================================
+
+Jun 2, 2026
+-----------
+
+This is a Python 2 compatible patch release backporting a set of security
+fixes from later Tornado versions.
+
+Security improvements
+~~~~~~~~~~~~~~~~~~~~~~~
+
+- **CVE-2024-52804** (``GHSA-8w49-h785-mj3c``): Cookie value unquoting in
+  ``httputil`` no longer has quadratic complexity, preventing a
+  denial-of-service from a crafted ``Cookie`` header.
+- **CVE-2025-47287** (``GHSA-7cx3-6m66-7c5m``): Malformed ``multipart/form-data``
+  bodies no longer emit a log message per part (a log-flood denial-of-service);
+  a malformed body now raises a single error.
+- **CVE-2026-31958** (``GHSA-qjxf-f2mg-c6mc``): ``multipart/form-data`` parsing
+  now caps the number of parts and the per-part header size to prevent a
+  denial-of-service from a body with very many parts.
+- **CVE-2026-35536** (``GHSA-fqwm-6jpj-5wxc``, ``GHSA-78cv-mqj4-43f7``):
+  ``RequestHandler.set_cookie`` now validates the ``name``, ``domain``,
+  ``path`` and ``samesite`` attributes for control characters, ``DEL`` and
+  ``;``, preventing cookie-attribute injection into the ``Set-Cookie`` header.
+- ``GHSA-753j-mpmx-qq6g``: HTTP request smuggling is mitigated by rejecting a
+  message that carries both ``Transfer-Encoding`` and ``Content-Length`` or a
+  duplicated/unknown ``Transfer-Encoding``, and by stripping only RFC 7230
+  optional whitespace (space and tab) from header values.
+- ``GHSA-qppv-j76h-2rpx``: ``Content-Length`` and chunk sizes are now parsed
+  strictly (digits only), rejecting values such as ``+10`` or ``1_0`` that a
+  proxy might interpret differently (request smuggling).
+- ``GHSA-w235-7p84-xx57``: Outgoing request headers containing a bare ``CR`` or
+  ``LF`` are rejected in both ``CurlAsyncHTTPClient`` and the HTTP/1 writer,
+  preventing header injection.
+
+.. note::
+
+   ``GHSA-hj3f-6gcp-jg8j`` (CVE-2023-28370) was already fixed in 5.1.1.1.
+
+   The ``multipart/form-data`` part-count limit (1000) and per-part header
+   size limit (10 KiB) introduced for CVE-2026-31958 are exposed as the
+   module-level constants ``tornado.httputil._MULTIPART_MAX_PARTS`` and
+   ``tornado.httputil._MULTIPART_MAX_PART_HEADER_SIZE`` for deployments that
+   need to raise them.

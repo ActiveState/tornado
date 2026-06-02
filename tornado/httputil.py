@@ -71,6 +71,12 @@ except ImportError:
 # terminator and ignore any preceding CR.
 _CRLF_RE = re.compile(r'\r?\n')
 
+# RFC 7230 section 3.2.3: only space and horizontal tab are valid optional
+# whitespace around header values. Stripping arbitrary unicode whitespace
+# (as bare str.strip() does) lets values containing e.g. \x85/\xa0 disagree
+# with a proxy's parsing and enables request smuggling (GHSA-753j-mpmx-qq6g).
+HTTP_WHITESPACE = " \t"
+
 
 class _NormalizedHeaderCache(dict):
     """Dynamic cached mapping of header names to Http-Header-Case.
@@ -187,7 +193,7 @@ class HTTPHeaders(collections.MutableMapping):
             # continuation of a multi-line header
             if self._last_key is None:
                 raise HTTPInputError("first header line cannot start with whitespace")
-            new_part = ' ' + line.lstrip()
+            new_part = ' ' + line.lstrip(HTTP_WHITESPACE)
             self._as_list[self._last_key][-1] += new_part
             self._dict[self._last_key] += new_part
         else:
@@ -195,7 +201,7 @@ class HTTPHeaders(collections.MutableMapping):
                 name, value = line.split(":", 1)
             except ValueError:
                 raise HTTPInputError("no colon in header line")
-            self.add(name, value.strip())
+            self.add(name, value.strip(HTTP_WHITESPACE))
 
     @classmethod
     def parse(cls, headers):
@@ -777,6 +783,14 @@ def parse_body_arguments(content_type, body, arguments, files, headers=None):
             gen_log.warning("Invalid multipart/form-data: %s", e)
 
 
+# CVE-2026-31958: cap the work done parsing a multipart body so a request with
+# a huge number of parts (or enormous per-part headers) cannot block the event
+# loop. These are deliberately generous (upstream defaults to 1000 parts); they
+# are module-level so a deployment with unusually large forms can raise them.
+_MULTIPART_MAX_PARTS = 1000
+_MULTIPART_MAX_PART_HEADER_SIZE = 10 * 1024
+
+
 def parse_multipart_form_data(boundary, data, arguments, files):
     """Parses a ``multipart/form-data`` body.
 
@@ -798,26 +812,31 @@ def parse_multipart_form_data(boundary, data, arguments, files):
         boundary = boundary[1:-1]
     final_boundary_index = data.rfind(b"--" + boundary + b"--")
     if final_boundary_index == -1:
-        gen_log.warning("Invalid multipart/form-data: no final boundary")
-        return
+        # CVE-2025-47287: raise (caught and logged once by the caller) instead
+        # of logging per malformed part, which let a crafted body flood the
+        # logs and block the event loop.
+        raise HTTPInputError("Invalid multipart/form-data: no final boundary")
     parts = data[:final_boundary_index].split(b"--" + boundary + b"\r\n")
+    if len(parts) > _MULTIPART_MAX_PARTS:
+        raise HTTPInputError(
+            "multipart/form-data has too many parts (>%d)" %
+            _MULTIPART_MAX_PARTS)
     for part in parts:
         if not part:
             continue
         eoh = part.find(b"\r\n\r\n")
         if eoh == -1:
-            gen_log.warning("multipart/form-data missing headers")
-            continue
+            raise HTTPInputError("multipart/form-data missing headers")
+        if eoh > _MULTIPART_MAX_PART_HEADER_SIZE:
+            raise HTTPInputError("multipart/form-data part headers too large")
         headers = HTTPHeaders.parse(part[:eoh].decode("utf-8"))
         disp_header = headers.get("Content-Disposition", "")
         disposition, disp_params = _parse_header(disp_header)
         if disposition != "form-data" or not part.endswith(b"\r\n"):
-            gen_log.warning("Invalid multipart/form-data")
-            continue
+            raise HTTPInputError("Invalid multipart/form-data")
         value = part[eoh + 4:-2]
         if not disp_params.get("name"):
-            gen_log.warning("multipart/form-data value missing name")
-            continue
+            raise HTTPInputError("multipart/form-data value missing name")
         name = disp_params["name"]
         if disp_params.get("filename"):
             ctype = headers.get("Content-Type", "application/unknown")
@@ -1014,15 +1033,26 @@ def qs_to_qsl(qs):
             yield (k, v)
 
 
-_OctalPatt = re.compile(r"\\[0-3][0-7][0-7]")
-_QuotePatt = re.compile(r"[\\].")
-_nulljoin = ''.join
+# CVE-2024-52804: the original character-by-character _unquote loop (copied
+# from the Python 3.5 stdlib) is O(n^2) and lets a crafted quoted cookie value
+# burn CPU on the event-loop thread. Use a single regex substitution instead,
+# copied from the Python 3.13 stdlib http.cookies._unquote.
+_unquote_sub = re.compile(r"\\(?:([0-3][0-7][0-7])|(.))").sub
+
+
+def _unquote_replace(m):
+    # NOTE: m[1]/m[2] subscripting requires Python 3.6+; use group() so this
+    # works on Python 2.7 as well.
+    if m.group(1):
+        return chr(int(m.group(1), 8))
+    else:
+        return m.group(2)
 
 
 def _unquote_cookie(str):
     """Handle double quotes and escaping in cookie values.
 
-    This method is copied verbatim from the Python 3.5 standard
+    This method is copied verbatim from the Python 3.13 standard
     library (http.cookies._unquote) so we don't have to depend on
     non-public interfaces.
     """
@@ -1043,30 +1073,7 @@ def _unquote_cookie(str):
     #    \012 --> \n
     #    \"   --> "
     #
-    i = 0
-    n = len(str)
-    res = []
-    while 0 <= i < n:
-        o_match = _OctalPatt.search(str, i)
-        q_match = _QuotePatt.search(str, i)
-        if not o_match and not q_match:              # Neither matched
-            res.append(str[i:])
-            break
-        # else:
-        j = k = -1
-        if o_match:
-            j = o_match.start(0)
-        if q_match:
-            k = q_match.start(0)
-        if q_match and (not o_match or k < j):     # QuotePatt matched
-            res.append(str[i:k])
-            res.append(str[k + 1])
-            i = k + 2
-        else:                                      # OctalPatt matched
-            res.append(str[i:j])
-            res.append(chr(int(str[j + 1:j + 4], 8)))
-            i = j + 4
-    return _nulljoin(res)
+    return _unquote_sub(_unquote_replace, str)
 
 
 def parse_cookie(cookie):
