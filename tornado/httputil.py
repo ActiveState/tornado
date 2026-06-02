@@ -1020,15 +1020,26 @@ def qs_to_qsl(qs):
             yield (k, v)
 
 
-_OctalPatt = re.compile(r"\\[0-3][0-7][0-7]")
-_QuotePatt = re.compile(r"[\\].")
-_nulljoin = ''.join
+# CVE-2024-52804: the original character-by-character _unquote loop (copied
+# from the Python 3.5 stdlib) is O(n^2) and lets a crafted quoted cookie value
+# burn CPU on the event-loop thread. Use a single regex substitution instead,
+# copied from the Python 3.13 stdlib http.cookies._unquote.
+_unquote_sub = re.compile(r"\\(?:([0-3][0-7][0-7])|(.))").sub
+
+
+def _unquote_replace(m):
+    # NOTE: m[1]/m[2] subscripting requires Python 3.6+; use group() so this
+    # works on Python 2.7 as well.
+    if m.group(1):
+        return chr(int(m.group(1), 8))
+    else:
+        return m.group(2)
 
 
 def _unquote_cookie(str):
     """Handle double quotes and escaping in cookie values.
 
-    This method is copied verbatim from the Python 3.5 standard
+    This method is copied verbatim from the Python 3.13 standard
     library (http.cookies._unquote) so we don't have to depend on
     non-public interfaces.
     """
@@ -1049,30 +1060,7 @@ def _unquote_cookie(str):
     #    \012 --> \n
     #    \"   --> "
     #
-    i = 0
-    n = len(str)
-    res = []
-    while 0 <= i < n:
-        o_match = _OctalPatt.search(str, i)
-        q_match = _QuotePatt.search(str, i)
-        if not o_match and not q_match:              # Neither matched
-            res.append(str[i:])
-            break
-        # else:
-        j = k = -1
-        if o_match:
-            j = o_match.start(0)
-        if q_match:
-            k = q_match.start(0)
-        if q_match and (not o_match or k < j):     # QuotePatt matched
-            res.append(str[i:k])
-            res.append(str[k + 1])
-            i = k + 2
-        else:                                      # OctalPatt matched
-            res.append(str[i:j])
-            res.append(chr(int(str[j + 1:j + 4], 8)))
-            i = j + 4
-    return _nulljoin(res)
+    return _unquote_sub(_unquote_replace, str)
 
 
 def parse_cookie(cookie):

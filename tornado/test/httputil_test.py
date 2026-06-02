@@ -528,3 +528,23 @@ class ParseCookieTest(unittest.TestCase):
         # but parse_cookie() should parse whitespace the same way
         # document.cookie parses whitespace.
         self.assertEqual(parse_cookie('  =  b  ;  ;  =  ;   c  =  ;  '), {'': 'b', 'c': ''})
+
+    def test_unquote(self):
+        from tornado.httputil import _unquote_cookie
+        self.assertEqual(_unquote_cookie(None), None)
+        self.assertEqual(_unquote_cookie('foo'), 'foo')
+        self.assertEqual(_unquote_cookie('"foo"'), 'foo')
+        self.assertEqual(_unquote_cookie(r'"\""'), '"')
+        self.assertEqual(_unquote_cookie(r'"\134"'), '\\')
+        self.assertEqual(_unquote_cookie(r'"\012"'), '\n')
+
+    def test_unquote_large(self):
+        # CVE-2024-52804: unquoting a long quoted value full of escapes must
+        # not take quadratic time. The old char-by-char loop would take many
+        # seconds (effectively a DoS); the regex implementation is near-instant.
+        from tornado.httputil import _unquote_cookie
+        n = 100000
+        start = time.time()
+        value = _unquote_cookie('"' + '\\134' * n + '"')
+        self.assertEqual(value, '\\' * n)
+        self.assertLess(time.time() - start, 5.0)
