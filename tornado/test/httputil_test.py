@@ -4,7 +4,7 @@ from __future__ import absolute_import, division, print_function
 from tornado.httputil import (
     url_concat, parse_multipart_form_data, HTTPHeaders, format_timestamp,
     HTTPServerRequest, parse_request_start_line, parse_cookie, qs_to_qsl,
-    HTTPInputError,
+    HTTPInputError, _MULTIPART_MAX_PARTS, _MULTIPART_MAX_PART_HEADER_SIZE,
 )
 from tornado.escape import utf8, native_str
 from tornado.util import PY3
@@ -215,6 +215,22 @@ Foo
         with self.assertRaises(HTTPInputError):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
+
+    def test_too_many_parts(self):
+        # CVE-2026-31958: a body with a very large number of parts must be
+        # rejected rather than parsed (which would block the event loop).
+        part = (b"--1234\r\nContent-Disposition: form-data; name=a\r\n"
+                b"\r\nv\r\n")
+        data = part * (_MULTIPART_MAX_PARTS + 1) + b"--1234--"
+        with self.assertRaises(HTTPInputError):
+            parse_multipart_form_data(b"1234", data, {}, {})
+
+    def test_part_headers_too_large(self):
+        # CVE-2026-31958: an enormous per-part header block must be rejected.
+        big_header = b"X-Bad: " + b"a" * (_MULTIPART_MAX_PART_HEADER_SIZE + 1)
+        data = b"--1234\r\n" + big_header + b"\r\n\r\nv\r\n--1234--"
+        with self.assertRaises(HTTPInputError):
+            parse_multipart_form_data(b"1234", data, {}, {})
 
     def test_invalid_content_disposition(self):
         data = b'''\

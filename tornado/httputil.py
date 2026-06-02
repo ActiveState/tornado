@@ -783,6 +783,14 @@ def parse_body_arguments(content_type, body, arguments, files, headers=None):
             gen_log.warning("Invalid multipart/form-data: %s", e)
 
 
+# CVE-2026-31958: cap the work done parsing a multipart body so a request with
+# a huge number of parts (or enormous per-part headers) cannot block the event
+# loop. These are deliberately generous (upstream defaults to 1000 parts); they
+# are module-level so a deployment with unusually large forms can raise them.
+_MULTIPART_MAX_PARTS = 1000
+_MULTIPART_MAX_PART_HEADER_SIZE = 10 * 1024
+
+
 def parse_multipart_form_data(boundary, data, arguments, files):
     """Parses a ``multipart/form-data`` body.
 
@@ -809,12 +817,18 @@ def parse_multipart_form_data(boundary, data, arguments, files):
         # logs and block the event loop.
         raise HTTPInputError("Invalid multipart/form-data: no final boundary")
     parts = data[:final_boundary_index].split(b"--" + boundary + b"\r\n")
+    if len(parts) > _MULTIPART_MAX_PARTS:
+        raise HTTPInputError(
+            "multipart/form-data has too many parts (>%d)" %
+            _MULTIPART_MAX_PARTS)
     for part in parts:
         if not part:
             continue
         eoh = part.find(b"\r\n\r\n")
         if eoh == -1:
             raise HTTPInputError("multipart/form-data missing headers")
+        if eoh > _MULTIPART_MAX_PART_HEADER_SIZE:
+            raise HTTPInputError("multipart/form-data part headers too large")
         headers = HTTPHeaders.parse(part[:eoh].decode("utf-8"))
         disp_header = headers.get("Content-Disposition", "")
         disposition, disp_params = _parse_header(disp_header)
