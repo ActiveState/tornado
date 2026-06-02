@@ -474,6 +474,40 @@ bar
 """.replace(b"\n", b"\r\n"))
             yield self.stream.read_until_close()
 
+    @gen_test
+    def test_lenient_content_length_rejected(self):
+        # GHSA-qppv-j76h-2rpx: Content-Length values that Python's int()
+        # accepts but a proxy would not (leading +, underscores) must be
+        # rejected to avoid request smuggling.
+        with ExpectLog(gen_log, '.*Only integer Content-Length is allowed'):
+            self.stream.write(b"""\
+POST /echo HTTP/1.1
+Content-Length: +10
+
+bar
+
+""".replace(b"\n", b"\r\n"))
+            yield self.stream.read_until_close()
+
+
+class StrictIntParsingTest(unittest.TestCase):
+    # GHSA-qppv-j76h-2rpx: Content-Length and chunk sizes must be parsed
+    # strictly (digits only), unlike Python's lenient int().
+    def test_parse_int(self):
+        from tornado.http1connection import parse_int
+        self.assertEqual(parse_int("10"), 10)
+        self.assertEqual(parse_int("0"), 0)
+        for bad in ["+10", "-10", "1_0", " 10", "10 ", "0x10", "10\n", "", "0b1", "1.0"]:
+            self.assertRaises(ValueError, parse_int, bad)
+
+    def test_parse_hex_int(self):
+        from tornado.http1connection import parse_hex_int
+        self.assertEqual(parse_hex_int("a"), 10)
+        self.assertEqual(parse_hex_int("FF"), 255)
+        self.assertEqual(parse_hex_int("0"), 0)
+        for bad in ["+a", "-a", "1_a", " a", "a ", "0xa", "a\n", "", "g", "1.0"]:
+            self.assertRaises(ValueError, parse_hex_int, bad)
+
 
 class XHeaderTest(HandlerBaseTestCase):
     class Handler(RequestHandler):

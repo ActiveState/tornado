@@ -34,6 +34,31 @@ from tornado import stack_context
 from tornado.util import GzipDecompressor, PY3
 
 
+# RFC 7230 section 3.3.2: Content-Length is a sequence of digits, and
+# RFC 7230 section 4.1: chunk-size is a sequence of hex digits. Python's
+# int() is more lenient (it accepts leading "+", surrounding whitespace, and
+# underscores on 3.6+), which can desync Tornado from a front-end proxy and
+# enable request smuggling. Parse them strictly instead.
+# NOTE: re.fullmatch / str.fullmatch are unavailable on Python 2.7, so anchor
+# with \Z (not $, which also matches a trailing newline).
+_CONTENT_LENGTH_RE = re.compile(r"[0-9]+\Z")
+_CHUNK_LENGTH_RE = re.compile(r"[0-9a-fA-F]+\Z")
+
+
+def parse_int(s):
+    """Parse a non-negative integer from a string, strictly (digits only)."""
+    if _CONTENT_LENGTH_RE.match(s) is None:
+        raise ValueError("not an integer: %r" % s)
+    return int(s)
+
+
+def parse_hex_int(s):
+    """Parse a non-negative hexadecimal integer from a string, strictly."""
+    if _CHUNK_LENGTH_RE.match(s) is None:
+        raise ValueError("not a hexadecimal integer: %r" % s)
+    return int(s, 16)
+
+
 class _QuietException(Exception):
     def __init__(self):
         pass
@@ -381,7 +406,8 @@ class HTTP1Connection(httputil.HTTPConnection):
              start_line.code == 304)):
             self._expected_content_remaining = 0
         elif 'Content-Length' in headers:
-            self._expected_content_remaining = int(headers['Content-Length'])
+            self._expected_content_remaining = parse_int(
+                native_str(headers['Content-Length']))
         else:
             self._expected_content_remaining = None
         # TODO: headers are supposed to be of type str, but we still have some
@@ -553,7 +579,7 @@ class HTTP1Connection(httputil.HTTPConnection):
                 headers["Content-Length"] = pieces[0]
 
             try:
-                content_length = int(headers["Content-Length"])
+                content_length = parse_int(native_str(headers["Content-Length"]))
             except ValueError:
                 # Handles non-integer Content-Length value.
                 raise httputil.HTTPInputError(
@@ -600,7 +626,10 @@ class HTTP1Connection(httputil.HTTPConnection):
         total_size = 0
         while True:
             chunk_len = yield self.stream.read_until(b"\r\n", max_bytes=64)
-            chunk_len = int(chunk_len.strip(), 16)
+            try:
+                chunk_len = parse_hex_int(native_str(chunk_len[:-2]))
+            except ValueError:
+                raise httputil.HTTPInputError("invalid chunk size")
             if chunk_len == 0:
                 crlf = yield self.stream.read_bytes(2)
                 if crlf != b'\r\n':
