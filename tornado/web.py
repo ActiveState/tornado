@@ -558,6 +558,23 @@ class RequestHandler(object):
         if re.search(r"[\x00-\x20]", name + value):
             # Don't let us accidentally inject bad stuff
             raise ValueError("Invalid cookie %r: %r" % (name, value))
+        # CVE-2026-35536 / GHSA-78cv-mqj4-43f7: cookie attributes must not
+        # contain control characters, DEL (0x7f), or semicolons. A semicolon
+        # in an attacker-controlled attribute (domain/path/samesite) would let
+        # them inject arbitrary additional attributes into the Set-Cookie
+        # header. (samesite has no dedicated parameter in this version; it
+        # arrives via **kwargs.)
+        for attr_name, attr_value in (
+            ("name", name),
+            ("domain", domain),
+            ("path", path),
+            ("samesite", kwargs.get("samesite")),
+        ):
+            if attr_value is not None and re.search(
+                    r"[\x00-\x20\x3b\x7f]", escape.native_str(attr_value)):
+                raise Cookie.CookieError(
+                    "Invalid cookie attribute %s=%r for cookie %r"
+                    % (attr_name, attr_value, name))
         if not hasattr(self, "_new_cookie"):
             self._new_cookie = Cookie.SimpleCookie()
         if name in self._new_cookie:

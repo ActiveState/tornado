@@ -277,6 +277,30 @@ class CookieTest(WebTestCase):
                 self.set_cookie("c", "1", httponly=True)
                 self.set_cookie("d", "1", httponly=False)
 
+        class SetCookieForbiddenCharHandler(RequestHandler):
+            def get(self):
+                # CVE-2026-35536 / GHSA-78cv-mqj4-43f7: forbidden characters
+                # (control chars, DEL, semicolon) in a cookie attribute must
+                # be rejected with a CookieError to prevent attribute injection.
+                try:
+                    from http.cookies import CookieError
+                except ImportError:
+                    from Cookie import CookieError
+                cases = [
+                    {"name": "a;b", "value": "v"},
+                    {"name": "a", "value": "v", "domain": "ex;ample.com"},
+                    {"name": "a", "value": "v", "path": "/da;nger"},
+                    {"name": "a", "value": "v", "samesite": "Lax;evil"},
+                    {"name": "a\x7fb", "value": "v"},
+                ]
+                for kw in cases:
+                    try:
+                        self.set_cookie(**kw)
+                    except CookieError:
+                        continue
+                    raise Exception("set_cookie failed to reject %r" % (kw,))
+                self.finish(b"ok")
+
         return [("/set", SetCookieHandler),
                 ("/get", GetCookieHandler),
                 ("/set_domain", SetCookieDomainHandler),
@@ -284,7 +308,8 @@ class CookieTest(WebTestCase):
                 ("/set_overwrite", SetCookieOverwriteHandler),
                 ("/set_max_age", SetCookieMaxAgeHandler),
                 ("/set_expires_days", SetCookieExpiresDaysHandler),
-                ("/set_falsy_flags", SetCookieFalsyFlags)
+                ("/set_falsy_flags", SetCookieFalsyFlags),
+                ("/set_forbidden_char", SetCookieForbiddenCharHandler),
                 ]
 
     def test_set_cookie(self):
@@ -294,6 +319,11 @@ class CookieTest(WebTestCase):
                           "str=asdf; Path=/",
                           "unicode=qwer; Path=/",
                           ])
+
+    def test_set_cookie_forbidden_char(self):
+        # CVE-2026-35536 / GHSA-78cv-mqj4-43f7: attribute injection is rejected.
+        response = self.fetch("/set_forbidden_char")
+        self.assertEqual(response.body, b"ok")
 
     def test_get_cookie(self):
         response = self.fetch("/get", headers={"Cookie": "foo=bar"})
