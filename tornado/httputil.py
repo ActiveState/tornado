@@ -77,6 +77,12 @@ _CRLF_RE = re.compile(r'\r?\n')
 # with a proxy's parsing and enables request smuggling (GHSA-753j-mpmx-qq6g).
 HTTP_WHITESPACE = " \t"
 
+# RFC 7230 section 3.1.2: reason-phrase = *( HTAB / SP / VCHAR / obs-text ).
+# set_status() falls back to "Unknown" for anything else, so an untrusted
+# reason cannot inject headers or markup (CVE-2025-67724). Anchored with \Z
+# because re.fullmatch is not available on Python 2.7.
+_REASON_PHRASE_RE = re.compile(r"[\t \x21-\x7e\x80-\xff]+\Z")
+
 
 class _NormalizedHeaderCache(dict):
     """Dynamic cached mapping of header names to Http-Header-Case.
