@@ -583,6 +583,13 @@ class RequestHandler(object):
                 raise Cookie.CookieError(
                     "Invalid cookie attribute %s=%r for cookie %r"
                     % (attr_name, attr_value, name))
+        # GHSA-c6v4-qj2h-f748: normalize max_age through int() so that a
+        # non-int max_age (which could smuggle extra cookie attributes into
+        # the header) is rejected with ValueError instead of being written
+        # out verbatim.
+        for key in ("max_age", "max-age"):
+            if kwargs.get(key):
+                kwargs[key] = int(kwargs[key])
         # GHSA-wwv5-g3v4-889x: every attribute passed through **kwargs gets
         # the same check, not only a lowercase samesite. Morsel keys are
         # case-insensitive, so Domain=, Path= or SameSite= reach the same
