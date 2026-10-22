@@ -86,6 +86,13 @@ def is_transfer_encoding_chunked(headers):
         "Unsupported Transfer-Encoding %s" % headers["Transfer-Encoding"])
 
 
+# The maximum number of informational (1xx) responses to accept before the
+# real response. Each one is processed with a recursive call to
+# _read_message, so an unbounded number of them would exhaust the stack.
+# There is no legitimate use for more than a handful.
+_MAX_1XX_RESPONSES = 10
+
+
 class _QuietException(Exception):
     def __init__(self):
         pass
@@ -208,7 +215,7 @@ class HTTP1Connection(httputil.HTTPConnection):
         return self._read_message(delegate)
 
     @gen.coroutine
-    def _read_message(self, delegate):
+    def _read_message(self, delegate, num_1xx=0):
         need_delegate_close = False
         try:
             header_future = self.stream.read_until_regex(
@@ -263,9 +270,20 @@ class HTTP1Connection(httputil.HTTPConnection):
                             'Transfer-Encoding' in headers):
                         raise httputil.HTTPInputError(
                             "Response code %d cannot have body" % code)
+                    if num_1xx >= _MAX_1XX_RESPONSES:
+                        raise httputil.HTTPInputError("Too many 1xx responses")
                     # TODO: client delegates will get headers_received twice
                     # in the case of a 100-continue.  Document or change?
-                    yield self._read_message(delegate)
+                    #
+                    # The recursive call reads the real response and owns
+                    # the delegate from here on, so there is nothing left
+                    # for this frame to do. Clear need_delegate_close so
+                    # that the finally block does not call
+                    # on_connection_close() on an already-finished
+                    # delegate.
+                    need_delegate_close = False
+                    result = yield self._read_message(delegate, num_1xx + 1)
+                    raise gen.Return(result)
             else:
                 if (headers.get("Expect") == "100-continue" and
                         not self._write_finished):
