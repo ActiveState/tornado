@@ -61,6 +61,7 @@ from __future__ import absolute_import, division, print_function
 
 import base64
 import binascii
+import collections
 import datetime
 import email.utils
 import functools
@@ -2474,6 +2475,15 @@ class StaticFileHandler(RequestHandler):
     argument to a directory containing all of the intended targets, or to a
     list of such directories. It defaults to the ``path`` argument.
 
+    This symlink check applies only when serving files. `make_static_url`
+    (and therefore `RequestHandler.static_url`) runs without a handler
+    instance, so it cannot see ``allowed_symlink_directory``, and it will
+    compute a version hash for any regular file that a symlink inside the
+    static directory points to, wherever that file is. The file's contents
+    are never served this way, but its hash (and whether it exists) is
+    revealed in the URL. Symlinks in the static directory should therefore
+    only be created by people trusted with the files they point to.
+
     To maximize the effectiveness of browser caching, this class supports
     versioned urls (by default using the argument ``?v=``).  If a version
     is given, we instruct the browser to cache this file indefinitely.
@@ -2520,7 +2530,26 @@ class StaticFileHandler(RequestHandler):
     """
     CACHE_MAX_AGE = 86400 * 365 * 10  # 10 years
 
-    _static_hashes = {}  # type: typing.Dict
+    #: The largest content (in bytes) that `get_content_version` will hash.
+    #: Hashing is synchronous, so this bounds how long
+    #: `~RequestHandler.static_url` can block the event loop. Larger files
+    #: get no version. Subclasses may change it.
+    #:
+    #: .. versionadded:: 5.1.1.post3
+    MAX_VERSION_CONTENT_SIZE = 64 * 1024 * 1024
+
+    #: The maximum number of versions that `get_version` keeps cached. When
+    #: the cache is full, the least recently used entry is discarded (and its
+    #: file will be read again if it is needed). This is far more than most
+    #: applications have static files; it exists to bound memory usage if
+    #: `~RequestHandler.static_url` is called with many distinct paths.
+    #: Subclasses may change it.
+    #:
+    #: .. versionadded:: 5.1.1.post3
+    MAX_CACHED_VERSIONS = 10000
+
+    # Ordered from least to most recently used.
+    _static_hashes = collections.OrderedDict()  # type: typing.Dict
     _lock = threading.Lock()  # protects _static_hashes
 
     # A single directory or a list of them. None means "not set", in which
@@ -2540,7 +2569,7 @@ class StaticFileHandler(RequestHandler):
     @classmethod
     def reset(cls):
         with cls._lock:
-            cls._static_hashes = {}
+            cls._static_hashes = collections.OrderedDict()
 
     def head(self, path):
         return self.get(path, include_body=False)
@@ -2692,9 +2721,20 @@ class StaticFileHandler(RequestHandler):
         as long as they are unique and understood by the subclass's
         overridden `get_content`.
 
+        Raises `HTTPError` (403) if ``path`` leads outside of ``root`` (as
+        written, e.g. with ``../``; symlinks are checked later by
+        `validate_absolute_path`). This check is also what keeps
+        `get_version` (and therefore `~RequestHandler.static_url`) from
+        reading files outside of the static directory.
+
         .. versionadded:: 3.1
+
+        .. versionchanged:: 5.1.1.post3
+           Paths outside of ``root`` now raise `HTTPError`
+           (GHSA-v8g8-cp5j-42fg).
         """
         abspath = os.path.abspath(os.path.join(root, path))
+        cls._check_in_root(root, abspath, path)
         return abspath
 
     def validate_absolute_path(self, root, absolute_path):
@@ -2717,23 +2757,7 @@ class StaticFileHandler(RequestHandler):
 
         .. versionadded:: 3.1
         """
-        # os.path.abspath strips a trailing /.
-        # We must add it back to `root` so that we only match files
-        # in a directory named `root` instead of files starting with
-        # that prefix.
-        root = os.path.abspath(root)
-        if not root.endswith(os.path.sep):
-            # abspath always removes a trailing slash, except when
-            # root is '/'. This is an unusual case, but several projects
-            # have independently discovered this technique to disable
-            # Tornado's path validation and (hopefully) do their own,
-            # so we need to support it.
-            root += os.path.sep
-        # The trailing slash also needs to be temporarily added back
-        # the requested path so a request to root/ will match.
-        if not (absolute_path + os.path.sep).startswith(root):
-            raise HTTPError(403, "%s is not in root static directory",
-                            self.path)
+        root = self._check_in_root(root, absolute_path, self.path)
         # GHSA-c2m8-h5v5-343r: symlinks may point anywhere inside
         # allowed_symlink_directory, which defaults to the directory being
         # served. Resolve that default here, against the same root the checks
@@ -2785,6 +2809,20 @@ class StaticFileHandler(RequestHandler):
         # generation each resolve the path again. Every one of those is a
         # separate trip through the filesystem that could observe a
         # different file from the one validated here.
+        self._stat_result = self._stat_regular_file(absolute_path, self.path)
+        return absolute_path
+
+    @staticmethod
+    def _stat_regular_file(absolute_path, path_message):
+        """Stats ``absolute_path`` and checks that it is a regular file.
+
+        Raises `HTTPError` (404) if the path cannot be stat'ed, or (403) if
+        it is anything other than a regular file. Directories, devices (such
+        as ``/dev/zero``, or ``CON`` and ``NUL``, which exist in every
+        directory on Windows), FIFOs and sockets must never be read: some of
+        them never end, and opening a FIFO blocks until there is a writer.
+        ``path_message`` is used only to build the error message.
+        """
         try:
             stat_result = os.stat(absolute_path)
         except OSError:
@@ -2792,9 +2830,35 @@ class StaticFileHandler(RequestHandler):
             # false when the path cannot be stat'ed at all.
             raise HTTPError(404)
         if not stat.S_ISREG(stat_result.st_mode):
-            raise HTTPError(403, "%s is not a file", self.path)
-        self._stat_result = stat_result
-        return absolute_path
+            raise HTTPError(403, "%s is not a file", path_message)
+        return stat_result
+
+    @staticmethod
+    def _check_in_root(root, absolute_path, path_message):
+        """Checks that ``absolute_path`` (as written) is inside ``root``.
+
+        Returns the normalized root, with a trailing separator. Raises
+        `HTTPError` (403) if the path is outside of it. ``path_message``
+        is used only to build the error message.
+        """
+        # os.path.abspath strips a trailing /.
+        # We must add it back to `root` so that we only match files
+        # in a directory named `root` instead of files starting with
+        # that prefix.
+        root = os.path.abspath(root)
+        if not root.endswith(os.path.sep):
+            # abspath always removes a trailing slash, except when
+            # root is '/'. This is an unusual case, but several projects
+            # have independently discovered this technique to disable
+            # Tornado's path validation and (hopefully) do their own,
+            # so we need to support it.
+            root += os.path.sep
+        # The trailing slash also needs to be temporarily added back
+        # the requested path so a request to root/ will match.
+        if not (absolute_path + os.path.sep).startswith(root):
+            raise HTTPError(403, "%s is not in root static directory",
+                            path_message)
+        return root
 
     @staticmethod
     def _resolve_symlink_target(absolute_path, allowed_symlink_directories,
@@ -2865,6 +2929,10 @@ class StaticFileHandler(RequestHandler):
 
         .. versionadded:: 3.1
         """
+        # validate_absolute_path has already checked this when serving a
+        # request, but get_content_version (for static_url) reaches this
+        # method with nothing but get_absolute_path in between.
+        cls._stat_regular_file(abspath, abspath)
         with open(abspath, "rb") as file:
             if start is not None:
                 file.seek(start)
@@ -2893,15 +2961,33 @@ class StaticFileHandler(RequestHandler):
         This class method may be overridden by subclasses.  The
         default implementation is a hash of the file's contents.
 
+        The hash is computed synchronously, so content larger than
+        `MAX_VERSION_CONTENT_SIZE` is not hashed (and gets no version)
+        rather than blocking the event loop for a long time.
+
         .. versionadded:: 3.1
+
+        .. versionchanged:: 5.1.1.post3
+           Content larger than `MAX_VERSION_CONTENT_SIZE` raises `ValueError`.
         """
         data = cls.get_content(abspath)
+        chunks = [data] if isinstance(data, bytes) else data
         hasher = hashlib.md5()
-        if isinstance(data, bytes):
-            hasher.update(data)
-        else:
-            for chunk in data:
+        size = 0
+        try:
+            for chunk in chunks:
+                size += len(chunk)
+                if size > cls.MAX_VERSION_CONTENT_SIZE:
+                    raise ValueError(
+                        "content is larger than MAX_VERSION_CONTENT_SIZE (%d bytes)"
+                        % cls.MAX_VERSION_CONTENT_SIZE)
                 hasher.update(chunk)
+        finally:
+            # Close the file now, rather than when the generator is collected,
+            # if we stopped early.
+            close = getattr(chunks, "close", None)
+            if close is not None:
+                close()
         return hasher.hexdigest()
 
     def _stat(self):
@@ -3025,10 +3111,20 @@ class StaticFileHandler(RequestHandler):
         The returned value should be a string, or ``None`` if no version
         could be determined.
 
+        As with `~RequestHandler.static_url`, ``path`` should name a known
+        static file and should not be derived from untrusted input. Versions
+        are cached (up to `MAX_CACHED_VERSIONS` entries) until ``reset`` is
+        called.
+
         .. versionchanged:: 3.1
            This method was previously recommended for subclasses to override;
            `get_content_version` is now preferred as it allows the base
            class to handle caching of the result.
+
+        .. versionchanged:: 5.1.1.post3
+           Paths outside ``static_path`` raise `HTTPError` (403), and files
+           that are not regular files, or are larger than
+           `MAX_VERSION_CONTENT_SIZE`, get no version (GHSA-v8g8-cp5j-42fg).
         """
         abs_path = cls.get_absolute_path(settings['static_path'], path)
         return cls._get_cached_version(abs_path)
@@ -3037,16 +3133,19 @@ class StaticFileHandler(RequestHandler):
     def _get_cached_version(cls, abs_path):
         with cls._lock:
             hashes = cls._static_hashes
-            if abs_path not in hashes:
+            if abs_path in hashes:
+                # Move the entry to the end to mark it as most recently used.
+                hsh = hashes[abs_path] = hashes.pop(abs_path)
+            else:
                 try:
-                    hashes[abs_path] = cls.get_content_version(abs_path)
-                except Exception:
-                    gen_log.error("Could not open static file %r", abs_path)
-                    hashes[abs_path] = None
-            hsh = hashes.get(abs_path)
-            if hsh:
-                return hsh
-        return None
+                    hsh = cls.get_content_version(abs_path)
+                except Exception as e:
+                    gen_log.error("Could not open static file %r: %s", abs_path, e)
+                    hsh = None
+                while hashes and len(hashes) >= cls.MAX_CACHED_VERSIONS:
+                    del hashes[next(iter(hashes))]
+                hashes[abs_path] = hsh
+            return hsh or None
 
 
 class FallbackHandler(RequestHandler):
