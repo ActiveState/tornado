@@ -19,6 +19,7 @@ from tornado.httpclient import HTTPRequest, HTTPResponse, _RequestProxy, HTTPErr
 from tornado.httpserver import HTTPServer
 from tornado.ioloop import IOLoop
 from tornado.iostream import IOStream
+from tornado.locks import Event
 from tornado.log import gen_log
 from tornado import netutil
 from tornado.stack_context import ExceptionStackContext, NullContext
@@ -55,12 +56,18 @@ class RedirectHandler(RequestHandler):
 
 
 class ChunkHandler(RequestHandler):
+    def initialize(self, first_chunk_received=None):
+        self.first_chunk_received = first_chunk_received
+
     @gen.coroutine
     def get(self):
         self.write("asdf")
         self.flush()
-        # Wait a bit to ensure the chunks are sent and received separately.
-        yield gen.sleep(0.01)
+        if self.first_chunk_received is not None and self.get_argument("wait", None):
+            # Don't send the second chunk until the client has received the
+            # first, so they can't be coalesced and the test can verify that
+            # chunks are delivered as they arrive.
+            yield self.first_chunk_received.wait()
         self.write("qwer")
 
 
@@ -197,12 +204,14 @@ class HTTPClientCommonTestCase(AsyncHTTPTestCase):
     malformed_message_log = gen_log
 
     def get_app(self):
+        self.first_chunk_received = Event()
         return Application([
             url("/hello", HelloWorldHandler),
             url("/post", PostHandler),
             url("/put", PutHandler),
             url("/redirect", RedirectHandler),
-            url("/chunk", ChunkHandler),
+            url("/chunk", ChunkHandler,
+                dict(first_chunk_received=self.first_chunk_received)),
             url("/auth", AuthHandler),
             url("/countdown/([0-9]+)", CountdownHandler, name="countdown"),
             url("/echopost", EchoPostHandler),
@@ -291,8 +300,13 @@ class HTTPClientCommonTestCase(AsyncHTTPTestCase):
         self.assertEqual(response.body, b"asdfqwer")
 
         chunks = []
-        response = self.fetch("/chunk",
-                              streaming_callback=chunks.append)
+
+        def streaming_callback(chunk):
+            chunks.append(chunk)
+            self.first_chunk_received.set()
+
+        response = self.fetch("/chunk?wait=1",
+                              streaming_callback=streaming_callback)
         self.assertEqual(chunks, [b"asdf", b"qwer"])
         self.assertFalse(response.body)
 
@@ -337,12 +351,13 @@ Transfer-Encoding: chunked
 
         def streaming_cb(chunk):
             chunks.append(chunk)
+            self.first_chunk_received.set()
             if chunk == b'qwer':
                 1 / 0
 
         with ignore_deprecation():
             with ExceptionStackContext(error_handler):
-                self.fetch('/chunk', streaming_callback=streaming_cb)
+                self.fetch('/chunk?wait=1', streaming_callback=streaming_cb)
 
         self.assertEqual(chunks, [b'asdf', b'qwer'])
         self.assertEqual(1, len(exc_info))
@@ -454,8 +469,9 @@ Transfer-Encoding: chunked
             # comes in.
             self.assertEqual(headers['content-type'], 'text/html; charset=UTF-8')
             chunks.append(chunk)
+            self.first_chunk_received.set()
 
-        self.fetch('/chunk', header_callback=header_callback,
+        self.fetch('/chunk?wait=1', header_callback=header_callback,
                    streaming_callback=streaming_callback)
         self.assertEqual(len(first_line), 1, first_line)
         self.assertRegexpMatches(first_line[0], 'HTTP/[0-9]\\.[0-9] 200.*\r\n')

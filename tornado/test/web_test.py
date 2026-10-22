@@ -2693,7 +2693,10 @@ class BaseStreamingRequestFlowControlTest(object):
                                        'post']))
 
     def test_flow_control_chunked_body(self):
-        chunks = [b'abcd', b'efgh', b'ijkl']
+        # Small chunks may be coalesced when they arrive together
+        # (GHSA-r4j5-9xpp-3985), so use chunks of exactly chunk_size (except
+        # the last) to get a predictable sequence of calls.
+        chunks = [b'abcdefghij', b'klmnopqrst', b'uvwxyz']
 
         @gen.coroutine
         def body_producer(write):
