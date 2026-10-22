@@ -92,6 +92,37 @@ advisory of their own:
   informational (``1xx``) responses, and no longer processes the response
   that follows a ``100 Continue`` twice.
 
+These come from Tornado 6.6.0 and have no advisory:
+
+- A gzip-encoded body with data after the end of the gzip stream no
+  longer hangs the IOLoop forever, in ``SimpleAsyncHTTPClient`` and in
+  ``HTTPServer(decompress_request=True)``. It is now rejected (599 or
+  400), as is a truncated stream. Bodies made of several concatenated gzip
+  members are now decompressed in full; previously only the first member
+  was kept. This is ``tornado.util.GzipDecompressor``, which
+  ``flush()`` now also checks for truncation.
+- Reading websocket frames yields to the IOLoop periodically, so a peer
+  sending many small frames cannot block it. At most one pong is
+  outstanding: while one is pending, only the most recent ping is
+  answered (as RFC 6455 section 5.5.3 permits). This bounds the memory a
+  peer that never reads its pongs can make the server use.
+- Valueless header parameters (such as the websocket
+  ``server_no_context_takeover`` and ``client_no_context_takeover``
+  options) are no longer dropped, so the client honors a server's request
+  not to keep compression context.
+
+libcurl requirements
+~~~~~~~~~~~~~~~~~~~~
+
+``CurlAsyncHTTPClient`` relies on libcurl for two of these fixes. Use
+libcurl 7.81 or newer, the same floor upstream Tornado documents.
+``GHSA-chx6-46f5-w4vp``'s streaming buffer pauses and resumes transfers.
+For ``CVE-2026-49853``, stripping ``Authorization`` and ``Cookie`` on a
+cross-origin redirect is done by libcurl when ``CurlAsyncHTTPClient`` is
+used. libcurl does this for a redirect to the same host on a different
+port only from 7.83.0 (CVE-2022-27776), so use 7.83.0 or newer if that
+matters. This release was tested with libcurl 8.17.0.
+
 Behavior changes
 ~~~~~~~~~~~~~~~~
 
@@ -118,6 +149,10 @@ particular:
 - The pieces passed to ``data_received`` (including
   ``@stream_request_body`` handlers) no longer correspond to HTTP chunk
   boundaries.
+- A gzip body with trailing data after the gzip stream, or a truncated
+  one, is rejected instead of being silently truncated or hanging.
+- A websocket peer that sends pings faster than it reads pongs gets a pong
+  only for the most recent of them.
 
 .. note::
 
