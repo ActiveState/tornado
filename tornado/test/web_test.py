@@ -294,6 +294,13 @@ class CookieTest(WebTestCase):
                     {"name": "a", "value": "v", "path": "/da;nger"},
                     {"name": "a", "value": "v", "samesite": "Lax;evil"},
                     {"name": "a\x7fb", "value": "v"},
+                    # GHSA-wwv5-g3v4-889x: the same attributes reached
+                    # through capitalized **kwargs.
+                    {"name": "a", "value": "v", "Domain": "evil.com; Secure"},
+                    {"name": "a", "value": "v", "DoMaIn": "example;.com"},
+                    {"name": "a", "value": "v", "Path": "/; SameSite=None"},
+                    {"name": "a", "value": "v", "SameSite": "None; Secure"},
+                    {"name": "a", "value": "v", "comment": "x\x00y"},
                 ]
                 for kw in cases:
                     try:

@@ -572,19 +572,31 @@ class RequestHandler(object):
         # contain control characters, DEL (0x7f), or semicolons. A semicolon
         # in an attacker-controlled attribute (domain/path/samesite) would let
         # them inject arbitrary additional attributes into the Set-Cookie
-        # header. (samesite has no dedicated parameter in this version; it
-        # arrives via **kwargs.)
+        # header.
         for attr_name, attr_value in (
             ("name", name),
             ("domain", domain),
             ("path", path),
-            ("samesite", kwargs.get("samesite")),
         ):
             if attr_value is not None and re.search(
                     r"[\x00-\x20\x3b\x7f]", escape.native_str(attr_value)):
                 raise Cookie.CookieError(
                     "Invalid cookie attribute %s=%r for cookie %r"
                     % (attr_name, attr_value, name))
+        # GHSA-wwv5-g3v4-889x: every attribute passed through **kwargs gets
+        # the same check, not only a lowercase samesite. Morsel keys are
+        # case-insensitive, so Domain=, Path= or SameSite= reach the same
+        # attributes as the checked arguments, and samesite and max_age have
+        # no dedicated parameter in this version.
+        for k, v in kwargs.items():
+            if isinstance(v, (unicode_type, bytes)):
+                v = escape.native_str(v)
+            else:
+                v = str(v)
+            if re.search(r"[\x00-\x20\x3b\x7f]", v):
+                raise Cookie.CookieError(
+                    "Invalid cookie attribute %s=%r for cookie %r"
+                    % (k, v, name))
         if not hasattr(self, "_new_cookie"):
             self._new_cookie = Cookie.SimpleCookie()
         if name in self._new_cookie:
