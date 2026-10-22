@@ -650,6 +650,41 @@ class DefaultCompressionTest(CompressionTestMixin, WebSocketBaseTestCase):
         self.assertEqual(bytes_out, bytes_in + 12)
 
 
+class ClientNoContextTakeoverTest(WebSocketBaseTestCase):
+    # _parse_header used to drop valueless parameters, so the client kept
+    # compression context when the server asked it not to.
+    MESSAGE = "Hello world. Testing 123 123"
+
+    def get_app(self):
+        self.close_future = Future()
+
+        class Handler(EchoHandler):
+            def set_header(self, name, value):
+                # Our client doesn't offer client_no_context_takeover, but
+                # a server may require it anyway.
+                if name == "Sec-WebSocket-Extensions":
+                    value += "; client_no_context_takeover"
+                super(Handler, self).set_header(name, value)
+
+        return Application([("/", Handler, dict(close_future=self.close_future,
+                                                compression_options={}))])
+
+    @gen_test
+    def test_client_no_context_takeover(self):
+        ws = yield self.ws_connect("/", compression_options={})
+        self.assertIsNotNone(ws.protocol._compressor)
+        sizes = []
+        for i in range(3):
+            before = ws.protocol._wire_bytes_out
+            ws.write_message(self.MESSAGE)
+            response = yield ws.read_message()
+            self.assertEqual(response, self.MESSAGE)
+            sizes.append(ws.protocol._wire_bytes_out - before)
+        # Without context takeover, repeated messages don't get smaller.
+        self.assertEqual(sizes, [sizes[0]] * 3)
+        yield self.close(ws)
+
+
 class FloodTest(WebSocketBaseTestCase):
     def get_app(self):
         test = self

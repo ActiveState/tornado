@@ -995,7 +995,8 @@ def _parseparam(s):
 def _parse_header(line):
     r"""Parse a Content-type like header.
 
-    Return the main content-type and a dictionary of options.
+    Return the main content-type and a dictionary of options. Parameters
+    without a value (as used in websocket extension negotiation) map to None.
 
     >>> d = "form-data; foo=\"b\\\\a\\\"r\"; file*=utf-8''T%C3%A4st"
     >>> ct, d = _parse_header(d)
@@ -1005,17 +1006,22 @@ def _parse_header(line):
     True
     >>> d['foo']
     'b\\a"r'
+    >>> _parse_header('permessage-deflate; client_no_context_takeover')
+    ('permessage-deflate', {'client_no_context_takeover': None})
     """
     parts = _parseparam(';' + line)
     key = next(parts)
     # decode_params treats first argument special, but we already stripped key
     params = [('Dummy', 'value')]
+    valueless = []
     for p in parts:
         i = p.find('=')
         if i >= 0:
             name = p[:i].strip().lower()
             value = p[i + 1:].strip()
             params.append((name, native_str(value)))
+        elif p:
+            valueless.append(native_str(p.lower()))
     params = email.utils.decode_params(params)
     params.pop(0)  # get rid of the dummy again
     pdict = {}
@@ -1024,6 +1030,9 @@ def _parse_header(line):
         if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
             value = value[1:-1]
         pdict[name] = value
+    for name in valueless:
+        # A parameter given with a value takes precedence.
+        pdict.setdefault(name, None)
     return key, pdict
 
 
