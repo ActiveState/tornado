@@ -1630,6 +1630,54 @@ class StaticFileSymlinkedRootTest(WebTestCase):
         self.assertEqual(response.body, b"inside")
 
 
+class StaticDefaultFilenameRootTest(WebTestCase):
+    def get_app_kwargs(self):
+        return dict(static_path=os.path.abspath(relpath('static')),
+                    static_handler_args=dict(default_filename='index.html'),
+                    static_url_prefix='/')
+
+    def get_handlers(self):
+        return []
+
+    def get_http_client(self):
+        # simple_httpclient only: curl doesn't let you send a request starting
+        # with two slashes.
+        return SimpleAsyncHTTPClient()
+
+    def test_no_open_redirect(self):
+        # This test verifies that the open redirect that affected some configurations
+        # prior to Tornado 6.3.2 (CVE-2023-28370, fixed here in 5.1.1.1) is no
+        # longer possible. The vulnerability required a static_url_prefix of "/"
+        # and a default_filename (any value) to be set. The absolute* server-side
+        # path to the static directory must also be known.
+        #
+        # * Almost absolute: On windows, the drive letter is stripped from the path.
+        test_dir = os.path.dirname(os.path.abspath(__file__))
+        drive, tail = os.path.splitdrive(test_dir)
+        if os.name == "posix":
+            self.assertEqual(tail, test_dir)
+        else:
+            test_dir = tail
+        with ExpectLog(gen_log, ".*cannot redirect path with two initial slashes"):
+            response = self.fetch("//evil.com/../%s/static/dir" % test_dir,
+                                  follow_redirects=False)
+        self.assertEqual(response.code, 403)
+
+    def test_no_open_redirect_backslash(self):
+        # GHSA-pw9p-v7r6-gx4p hardening: browsers treat a backslash like a
+        # slash, so a redirect to /\evil.com is protocol-relative too. This
+        # form doesn't need the server-side path.
+        if os.name == "posix":
+            expected_log = ".*cannot redirect path with two initial slashes"
+        else:
+            # On Windows the backslash makes this an absolute path, so it is
+            # rejected earlier by the check that the file is under the root.
+            expected_log = ".*is not in root static directory"
+        with ExpectLog(gen_log, expected_log):
+            response = self.fetch("/\\evil.com/../dir", follow_redirects=False)
+        self.assertEqual(response.code, 403)
+
+
 @wsgi_safe
 class StaticDefaultFilenameTest(WebTestCase):
     def get_app_kwargs(self):
@@ -3297,6 +3345,8 @@ class RedirectHandlerTest(WebTestCase):
         return [
             ('/src', WebRedirectHandler, {'url': '/dst'}),
             ('/src2', WebRedirectHandler, {'url': '/dst2?foo=bar'}),
+            (r'/any/(.*)', WebRedirectHandler, {'url': '{0}'}),
+            (r'/moved(.*)', WebRedirectHandler, {'url': 'https://example.com{0}'}),
             (r'/(.*?)/(.*?)/(.*)', WebRedirectHandler, {'url': '/{1}/{0}/{2}'})]
 
     def test_basic_redirect(self):
@@ -3318,3 +3368,45 @@ class RedirectHandlerTest(WebTestCase):
         response = self.fetch('/a/b/c', follow_redirects=False)
         self.assertEqual(response.code, 301)
         self.assertEqual(response.headers['Location'], '/b/a/c')
+
+    def assert_rejected(self, path):
+        with ExpectLog(gen_log, ".*Redirect URL cannot change the scheme or netloc"):
+            response = self.fetch(path, follow_redirects=False)
+        self.assertEqual(response.code, 400, path)
+
+    def test_redirect_double_slash(self):
+        # GHSA-pw9p-v7r6-gx4p. Note that the redirect pattern we're using
+        # reorders the components.
+        response = self.fetch("/a/example.com/b", follow_redirects=False)
+        self.assertEqual(response.code, 301)
+        self.assertEqual(response.headers["Location"], "/example.com/a/b")
+
+        # With a double slash this becomes //example.com/a/b, which is a protocol-relative
+        # redirect to another host, which we disallow because it is an open redirect.
+        self.assert_rejected("/a//example.com/a/b")
+
+        # Browsers treat backslashes like slashes and ignore tabs and newlines,
+        # so these variants are also protocol-relative. Path arguments are
+        # url-decoded, so they can be smuggled in with percent-encoding.
+        for path in ["/a/%5Cexample.com/b", "/a/%09/example.com/b"]:
+            self.assert_rejected(path)
+
+    def test_redirect_cannot_change_host(self):
+        # Substitutions directly after the host can extend it or add userinfo.
+        response = self.fetch("/moved/x", follow_redirects=False)
+        self.assertEqual(response.code, 301)
+        self.assertEqual(response.headers["Location"], "https://example.com/x")
+        for path in ["/moved.evil.com/x", "/moved@evil.com/x", "/moved:8080/x"]:
+            self.assert_rejected(path)
+
+    def test_template_starting_with_substitution(self):
+        # A relative URL is fine, but the client cannot supply an absolute one.
+        response = self.fetch("/any/foo/bar", follow_redirects=False)
+        self.assertEqual(response.code, 301)
+        self.assertEqual(response.headers["Location"], "foo/bar")
+        for path in [
+            "/any/https://evil.com/",
+            "/any/%5C%5Cevil.com/",
+            "/any/javascript:alert(1)",
+        ]:
+            self.assert_rejected(path)
