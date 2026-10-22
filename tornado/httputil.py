@@ -844,7 +844,10 @@ def parse_multipart_form_data(boundary, data, arguments, files):
         # of logging per malformed part, which let a crafted body flood the
         # logs and block the event loop.
         raise HTTPInputError("Invalid multipart/form-data: no final boundary")
-    parts = data[:final_boundary_index].split(b"--" + boundary + b"\r\n")
+    # GHSA-8423-8fgw-73vq: cap the split so a body with a huge number of parts
+    # is rejected without first materializing every part as a separate copy.
+    parts = data[:final_boundary_index].split(
+        b"--" + boundary + b"\r\n", _MULTIPART_MAX_PARTS + 1)
     if len(parts) > _MULTIPART_MAX_PARTS:
         raise HTTPInputError(
             "multipart/form-data has too many parts (>%d)" %

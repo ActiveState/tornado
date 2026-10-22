@@ -227,6 +227,23 @@ Foo
         with self.assertRaises(HTTPInputError):
             parse_multipart_form_data(b"1234", data, {}, {})
 
+    def test_max_parts_boundary(self):
+        # GHSA-8423-8fgw-73vq: the split is capped at _MULTIPART_MAX_PARTS + 1
+        # so an oversized body is rejected without building every part. The
+        # cap must not move the limit: the empty chunk before the first
+        # boundary counts towards it, so _MULTIPART_MAX_PARTS - 1 real parts
+        # is the largest body accepted, both before and after the cap.
+        part = (b"--1234\r\nContent-Disposition: form-data; name=a\r\n"
+                b"\r\nv\r\n")
+        args = {}
+        data = part * (_MULTIPART_MAX_PARTS - 1) + b"--1234--"
+        parse_multipart_form_data(b"1234", data, args, {})
+        self.assertEqual(len(args["a"]), _MULTIPART_MAX_PARTS - 1)
+        for n in (_MULTIPART_MAX_PARTS, 100 * _MULTIPART_MAX_PARTS):
+            data = part * n + b"--1234--"
+            with self.assertRaises(HTTPInputError):
+                parse_multipart_form_data(b"1234", data, {}, {})
+
     def test_part_headers_too_large(self):
         # CVE-2026-31958: an enormous per-part header block must be rejected.
         big_header = b"X-Bad: " + b"a" * (_MULTIPART_MAX_PART_HEADER_SIZE + 1)
