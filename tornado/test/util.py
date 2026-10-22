@@ -116,3 +116,20 @@ def ignore_deprecation():
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', DeprecationWarning)
         yield
+
+
+def gzip_compress(data):
+    """``gzip.compress``, which Python 2 lacks: one gzip member."""
+    import gzip
+    import io
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as f:
+        f.write(data)
+    return buf.getvalue()
+
+
+def random_bytes(n, seed=0):
+    """``random.Random(seed).randbytes(n)``, which Python 2 lacks."""
+    import random
+    r = random.Random(seed)
+    return bytes(bytearray(r.getrandbits(8) for _ in range(n)))

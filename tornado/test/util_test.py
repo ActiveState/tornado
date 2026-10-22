@@ -6,16 +6,140 @@ import datetime
 
 import tornado.escape
 from tornado.escape import utf8
-from tornado.test.util import unittest
+from tornado.test.util import unittest, gzip_compress, random_bytes
 from tornado.util import (
     raise_exc_info, Configurable, exec_in, ArgReplacer,
     timedelta_to_seconds, import_object, re_unescape, is_finalizing, PY3,
+    GzipDecompressor,
 )
+import zlib
 
 if PY3:
     from io import StringIO
 else:
     from cStringIO import StringIO
+
+
+class GzipDecompressorTest(unittest.TestCase):
+    def members(self):
+        return [
+            # Incompressible, so that members span many reads.
+            random_bytes(5000),
+            b"",
+            b"hello " * 2000,
+            b"x",
+        ]
+
+    def decompress(self, data, read_size=1024, max_length=1024):
+        # Drive the decompressor the way _GzipMessageDelegate does.
+        decompressor = GzipDecompressor()
+        result = bytearray()
+        for i in range(0, len(data), read_size):
+            chunk = data[i:i + read_size]
+            while chunk:
+                output = decompressor.decompress(chunk, max_length)
+                self.assertLessEqual(len(output), max_length)
+                tail = decompressor.unconsumed_tail
+                self.assertTrue(output or len(tail) < len(chunk), "no progress")
+                chunk = tail
+                result += output
+        self.assertEqual(decompressor.flush(), b"")
+        return bytes(result)
+
+    def test_members(self):
+        members = self.members()
+        streams = [gzip_compress(m) for m in members]
+        cases = [
+            (streams[0], members[0]),
+            (streams[2], members[2]),
+            (b"".join(streams), b"".join(members)),
+            (b"".join(streams[1:]), b"".join(members[1:])),
+        ]
+        for data, expected in cases:
+            for read_size in [1, 7, 100, 4096, len(data)]:
+                for max_length in [1, 100, 5000, 65536]:
+                    self.assertEqual(
+                        self.decompress(data, read_size, max_length), expected,
+                        (len(data), read_size, max_length))
+
+    def test_member_ends_at_max_length(self):
+        # When the output of a member ends exactly at max_length, the next
+        # member must still be decompressed, even though the call that
+        # fills max_length may leave nothing more to read.
+        first = random_bytes(1000)
+        data = gzip_compress(first) + gzip_compress(b"second")
+        for max_length in [1000, 500, 100]:
+            for read_size in [len(data), 100]:
+                self.assertEqual(self.decompress(data, read_size, max_length),
+                                 first + b"second", (max_length, read_size))
+
+    def test_member_ends_at_read_boundary(self):
+        # Python 2's decompressobj has no eof attribute, so a member that
+        # ends exactly at the end of one read is only seen to have ended
+        # when the next read arrives.
+        first = gzip_compress(b"first")
+        data = first + gzip_compress(b"second")
+        self.assertEqual(self.decompress(data, len(first)), b"firstsecond")
+
+    def test_empty(self):
+        # A stream with no members, e.g. the body of a response to a HEAD request.
+        decompressor = GzipDecompressor()
+        self.assertEqual(decompressor.flush(), b"")
+
+    def test_trailing_data(self):
+        data = gzip_compress(b"hello")
+        for trailer in [b"\0", b"\0" * 16, b"\r\n", b"garbage", b"\x1f\x00"]:
+            for read_size in [1, 1024]:
+                with self.assertRaises(zlib.error):
+                    self.decompress(data + trailer, read_size)
+
+    def test_trailing_data_after_max_length(self):
+        # The reviewer's case: a member that ends in a call following one cut
+        # short by max_length leaves the trailing bytes in unconsumed_tail as
+        # well as unused_data (a CPython bug). Looping on unconsumed_tail
+        # used to spin forever instead of reporting the trailing data.
+        data = gzip_compress(random_bytes(70000) + b"x" * 200000)
+        with self.assertRaises(zlib.error):
+            self.decompress(data + b"TRAILING-GARBAGE", len(data) + 16, 65536)
+
+    def test_truncated(self):
+        members = self.members()
+        first = gzip_compress(members[0])
+        second = gzip_compress(members[2])
+        for data in [
+            first[:-1],
+            first[:len(first) // 2],
+            first + second[:1],
+            first + second[:-1],
+        ]:
+            with self.assertRaises(zlib.error):
+                self.decompress(data)
+
+    def test_not_gzip(self):
+        for data in [b"<html>", zlib.compress(b"hello")]:
+            with self.assertRaises(zlib.error):
+                self.decompress(data)
+
+    def test_flush_with_unconsumed_tail(self):
+        # A decompression bomb that the caller stops feeding back in after
+        # the first max_length bytes. flush must not decompress the rest.
+        compressor = zlib.compressobj(9, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+        block = b"\0" * (1024 * 1024)
+        bomb = b"".join(compressor.compress(block) for _ in range(16))
+        bomb += compressor.flush()
+        decompressor = GzipDecompressor()
+        self.assertEqual(len(decompressor.decompress(bomb, 1024)), 1024)
+        self.assertTrue(decompressor.unconsumed_tail)
+        with self.assertRaises(ValueError):
+            decompressor.flush()
+
+    def test_no_max_length(self):
+        # Without max_length, all the members are decompressed in one call.
+        # (Upstream also deprecates this; that warning is not backported.)
+        data = gzip_compress(b"hello") + gzip_compress(b" world")
+        decompressor = GzipDecompressor()
+        self.assertEqual(decompressor.decompress(data), b"hello world")
+        self.assertEqual(decompressor.flush(), b"")
 
 
 class RaiseExcInfoTest(unittest.TestCase):

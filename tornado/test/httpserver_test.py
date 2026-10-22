@@ -15,7 +15,7 @@ from tornado.netutil import ssl_options_to_context
 from tornado.routing import Router
 from tornado.simple_httpclient import SimpleAsyncHTTPClient
 from tornado.testing import AsyncHTTPTestCase, AsyncHTTPSTestCase, AsyncTestCase, ExpectLog, gen_test  # noqa: E501
-from tornado.test.util import unittest, skipOnTravis
+from tornado.test.util import unittest, skipOnTravis, gzip_compress, random_bytes
 from tornado.web import Application, RequestHandler, stream_request_body
 
 from contextlib import closing
@@ -964,10 +964,47 @@ class GzipTest(GzipBaseTest, AsyncHTTPTestCase):
         response = self.post_gzip('foo=bar')
         self.assertEquals(json_decode(response.body), {u'foo': [u'bar']})
 
+    def test_gzip_concatenated(self):
+        response = self.fetch('/', method='POST',
+                              body=gzip_compress(b'foo=') + gzip_compress(b'bar'),
+                              headers={'Content-Encoding': 'gzip'})
+        self.assertEqual(json_decode(response.body), {u'foo': [u'bar']})
+
+    def test_gzip_invalid(self):
+        body = gzip_compress(b'foo=bar')
+        for invalid in [body + b'\0', body[:-1]]:
+            with ExpectLog(gen_log, '.*invalid gzip data'):
+                response = self.fetch('/', method='POST', body=invalid,
+                                      headers={'Content-Encoding': 'gzip'})
+            self.assertEqual(response.code, 400)
+
     def test_size_limit(self):
         # CVE-2026-49855
         with ExpectLog(gen_log, ".*decompressed body too large"):
             self.post_gzip("x" * 101)
+
+
+class GzipTrailingDataTest(AsyncHTTPTestCase):
+    # A gzip member that ends in a call following one cut short by the
+    # chunk_size limit leaves trailing bytes in unconsumed_tail as well as
+    # unused_data (a CPython bug). _GzipMessageDelegate looped on
+    # unconsumed_tail forever without yielding, so one such POST stopped the
+    # server from serving every connection.
+    def get_app(self):
+        return Application([('/', EchoHandler)])
+
+    def get_httpserver_options(self):
+        return dict(decompress_request=True)
+
+    def test_trailing_garbage(self):
+        body = gzip_compress(random_bytes(70000) + b'x' * 200000) + b'TRAILING-GARBAGE'
+        with ExpectLog(gen_log, '.*invalid gzip data'):
+            response = self.fetch('/', method='POST', body=body,
+                                  headers={'Content-Encoding': 'gzip'})
+        self.assertEqual(response.code, 400)
+        # The server is still serving.
+        response = self.fetch('/', method='POST', body='foo=bar')
+        self.assertEqual(json_decode(response.body), {u'foo': [u'bar']})
 
 
 class GzipUnsupportedTest(GzipBaseTest, AsyncHTTPTestCase):
