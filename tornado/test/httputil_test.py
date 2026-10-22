@@ -5,7 +5,7 @@ from tornado.httputil import (
     url_concat, parse_multipart_form_data, HTTPHeaders, format_timestamp,
     HTTPServerRequest, parse_request_start_line, parse_cookie, qs_to_qsl,
     HTTPInputError, _MULTIPART_MAX_PARTS, _MULTIPART_MAX_PART_HEADER_SIZE,
-    _parse_header,
+    _parse_header, parse_body_arguments, _URLENCODED_MAX_ARGUMENTS,
 )
 from tornado.escape import utf8, native_str
 from tornado.util import PY3
@@ -121,6 +121,31 @@ class QsParseTest(unittest.TestCase):
         self.assertIn(('a', '1'), qsl)
         self.assertIn(('a', '3'), qsl)
         self.assertIn(('b', '2'), qsl)
+
+
+class UrlEncodedDataTest(unittest.TestCase):
+    def test_urlencoded_data(self):
+        data = b"a=1&b=2&a=3"
+        args, files = {}, {}
+        parse_body_arguments("application/x-www-form-urlencoded", data, args, files)
+        self.assertEqual(args["a"], [b"1", b"3"])
+        self.assertEqual(args["b"], [b"2"])
+        self.assertEqual(files, {})
+
+    def test_max_arguments(self):
+        # CVE-2026-82397. Upstream raises HTTPInputError here; 5.1.1's
+        # parse_body_arguments logs malformed bodies and parses nothing.
+        data = b"".join(b"a=1&" for _ in range(_URLENCODED_MAX_ARGUMENTS + 1))
+        args, files = {}, {}
+        with ExpectLog(gen_log, ".*Max number of fields exceeded"):
+            parse_body_arguments("application/x-www-form-urlencoded", data, args, files)
+        self.assertEqual(args, {})
+
+    def test_max_arguments_boundary(self):
+        data = b"&".join(b"a=1" for _ in range(_URLENCODED_MAX_ARGUMENTS))
+        args, files = {}, {}
+        parse_body_arguments("application/x-www-form-urlencoded", data, args, files)
+        self.assertEqual(len(args["a"]), _URLENCODED_MAX_ARGUMENTS)
 
 
 class MultipartFormDataTest(unittest.TestCase):

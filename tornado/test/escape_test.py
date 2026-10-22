@@ -4,6 +4,7 @@ import tornado.escape
 from tornado.escape import (
     utf8, xhtml_escape, xhtml_unescape, url_escape, url_unescape,
     to_unicode, json_decode, json_encode, squeeze, recursive_unicode,
+    parse_qs_bytes,
 )
 from tornado.util import unicode_type
 from tornado.test.util import unittest
@@ -248,3 +249,30 @@ class EscapeTestCase(unittest.TestCase):
         self.assertEqual(recursive_unicode(tests['list']), [u"foo", u"bar"])
         self.assertEqual(recursive_unicode(tests['tuple']), (u"foo", u"bar"))
         self.assertEqual(recursive_unicode(tests['bytes']), u"foo")
+
+
+class ParseQsBytesTest(unittest.TestCase):
+    # CVE-2026-82397: parse_qs_bytes takes a field limit so callers can bound
+    # the cost of parsing an attacker-controlled query string or body.
+    def check_limit(self):
+        self.assertEqual(parse_qs_bytes("a=1&b=2&a=3", max_num_fields=3),
+                         {"a": [b"1", b"3"], "b": [b"2"]})
+        with self.assertRaises(ValueError) as cm:
+            parse_qs_bytes("a=1&b=2&a=3", max_num_fields=2)
+        self.assertIn("Max number of fields exceeded", str(cm.exception))
+        # No limit unless one is requested.
+        self.assertEqual(len(parse_qs_bytes("&".join(["a=1"] * 5000))["a"]),
+                         5000)
+
+    def test_max_num_fields(self):
+        self.check_limit()
+
+    def test_max_num_fields_fallback(self):
+        # Interpreters older than 2.7.16 / 3.6.8 have no max_num_fields
+        # argument; the limit is then counted by tornado itself.
+        saved = tornado.escape._PARSE_QS_HAS_MAX_NUM_FIELDS
+        tornado.escape._PARSE_QS_HAS_MAX_NUM_FIELDS = False
+        try:
+            self.check_limit()
+        finally:
+            tornado.escape._PARSE_QS_HAS_MAX_NUM_FIELDS = saved

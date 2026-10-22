@@ -790,7 +790,9 @@ def parse_body_arguments(content_type, body, arguments, files, headers=None):
         return
     if content_type.startswith("application/x-www-form-urlencoded"):
         try:
-            uri_arguments = parse_qs_bytes(native_str(body), keep_blank_values=True)
+            uri_arguments = parse_qs_bytes(
+                native_str(body), keep_blank_values=True,
+                max_num_fields=_URLENCODED_MAX_ARGUMENTS)
         except Exception as e:
             gen_log.warning('Invalid x-www-form-urlencoded body: %s', e)
             uri_arguments = {}
@@ -817,6 +819,13 @@ def parse_body_arguments(content_type, body, arguments, files, headers=None):
 # are module-level so a deployment with unusually large forms can raise them.
 _MULTIPART_MAX_PARTS = 1000
 _MULTIPART_MAX_PART_HEADER_SIZE = 10 * 1024
+
+# CVE-2026-82397: the maximum number of arguments parsed from an
+# application/x-www-form-urlencoded body. Parsing cost grows superlinearly
+# with the field count, so an unbounded body of separators could stall the
+# event loop. 1000 is upstream's default (also used by php and node.js);
+# like the multipart limits it is module-level so it can be raised.
+_URLENCODED_MAX_ARGUMENTS = 1000
 
 
 def parse_multipart_form_data(boundary, data, arguments, files):
