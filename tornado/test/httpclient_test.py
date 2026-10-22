@@ -11,13 +11,15 @@ import datetime
 from io import BytesIO
 import time
 import unicodedata
+import zlib
 
-from tornado.escape import utf8, native_str
+from tornado.escape import utf8, native_str, json_encode, json_decode
 from tornado import gen
 from tornado.httpclient import HTTPRequest, HTTPResponse, _RequestProxy, HTTPError, HTTPClient
 from tornado.httpserver import HTTPServer
 from tornado.ioloop import IOLoop
 from tornado.iostream import IOStream
+from tornado.locks import Event
 from tornado.log import gen_log
 from tornado import netutil
 from tornado.stack_context import ExceptionStackContext, NullContext
@@ -54,12 +56,18 @@ class RedirectHandler(RequestHandler):
 
 
 class ChunkHandler(RequestHandler):
+    def initialize(self, first_chunk_received=None):
+        self.first_chunk_received = first_chunk_received
+
     @gen.coroutine
     def get(self):
         self.write("asdf")
         self.flush()
-        # Wait a bit to ensure the chunks are sent and received separately.
-        yield gen.sleep(0.01)
+        if self.first_chunk_received is not None and self.get_argument("wait", None):
+            # Don't send the second chunk until the client has received the
+            # first, so they can't be coalesced and the test can verify that
+            # chunks are delivered as they arrive.
+            yield self.first_chunk_received.wait()
         self.write("qwer")
 
 
@@ -122,19 +130,88 @@ class SetHeaderHandler(RequestHandler):
                         self.request.arguments['v']):
             self.set_header(k, v)
 
+
+class EchoHeadersHandler(RequestHandler):
+    def get(self):
+        self.write(json_encode(dict(self.request.headers.get_all())))
+
+
+# Decompressed size of the response served by `GzipBombHandler`. Kept below
+# every implementation's default ``max_body_size`` of 100MB so that a
+# streaming_callback can retrieve the whole thing; raising it past that limit
+# would turn this into a test of the limit instead (see
+# `HTTPClientMaxBodySizeTestMixin`). Upstream uses 64MB; 16MB keeps the
+# Python 2 run short and is still many times the 1MB streaming buffer.
+GZIP_BOMB_SIZE = 16 * 1024 * 1024
+
+_gzip_bombs = {}
+
+
+def gzip_bomb(size=GZIP_BOMB_SIZE):
+    """Returns a small gzip stream that expands to ``size`` bytes.
+
+    Compressed incrementally so that building it does not itself allocate
+    the decompressed size.
+    """
+    if size not in _gzip_bombs:
+        compressor = zlib.compressobj(9, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+        block = b"\0" * (1024 * 1024)
+        pieces = [compressor.compress(block) for _ in range(size // len(block))]
+        pieces.append(compressor.flush())
+        _gzip_bombs[size] = b"".join(pieces)
+    return _gzip_bombs[size]
+
+
+_large_body = []
+
+
+def large_body():
+    """Returns a body big enough to be delivered in several chunks.
+
+    The contents are non-repeating so that a chunk which was dropped,
+    duplicated or delivered out of order can be detected.
+    """
+    if not _large_body:
+        _large_body.append(b"".join(utf8("%09d\n" % i) for i in range(100000)))
+    return _large_body[0]
+
+
+class GzipBombHandler(RequestHandler):
+    """Sends a small response that decompresses to a very large one."""
+
+    def get(self):
+        size = int(self.get_argument("size", str(GZIP_BOMB_SIZE)))
+        # Set Content-Encoding manually to avoid automatic gzip encoding.
+        self.set_header("Content-Encoding", "gzip")
+        self.write(gzip_bomb(size))
+
+
+class LargeBodyHandler(RequestHandler):
+    def get(self):
+        # An incompressible content type, so that the server's gzip
+        # transform leaves the body alone and this exercises the plain
+        # streaming path.
+        self.set_header("Content-Type", "application/octet-stream")
+        self.write(large_body())
+
 # These tests end up getting run redundantly: once here with the default
 # HTTPClient implementation, and then again in each implementation's own
 # test suite.
 
 
 class HTTPClientCommonTestCase(AsyncHTTPTestCase):
+    # Logger the client implementation uses to report a malformed response.
+    malformed_message_log = gen_log
+
     def get_app(self):
+        self.first_chunk_received = Event()
         return Application([
             url("/hello", HelloWorldHandler),
             url("/post", PostHandler),
             url("/put", PutHandler),
             url("/redirect", RedirectHandler),
-            url("/chunk", ChunkHandler),
+            url("/chunk", ChunkHandler,
+                dict(first_chunk_received=self.first_chunk_received)),
             url("/auth", AuthHandler),
             url("/countdown/([0-9]+)", CountdownHandler, name="countdown"),
             url("/echopost", EchoPostHandler),
@@ -143,7 +220,22 @@ class HTTPClientCommonTestCase(AsyncHTTPTestCase):
             url("/all_methods", AllMethodsHandler),
             url('/patch', PatchHandler),
             url('/set_header', SetHeaderHandler),
+            url("/echo_headers", EchoHeadersHandler),
+            url("/gzip_bomb", GzipBombHandler),
+            url("/large_body", LargeBodyHandler),
         ], gzip=True)
+
+    def setUp(self):
+        super(HTTPClientCommonTestCase, self).setUp()
+
+        # Add a second port (serving the same app) to the HTTP server, so we can test the effects
+        # of redirects that span different origins.
+        sock, port = bind_unused_port()
+        self.http_server.add_socket(sock)
+        self.__port2 = port
+
+    def get_url2(self, path):
+        return "%s://127.0.0.1:%s%s" % (self.get_protocol(), self.__port2, path)
 
     def test_patch_receives_payload(self):
         body = b"some patch data"
@@ -171,6 +263,32 @@ class HTTPClientCommonTestCase(AsyncHTTPTestCase):
         self.assertEqual(chunks, [b"Hello world!"])
         self.assertFalse(response.body)
 
+    def test_streaming_callback_large_body(self):
+        # A body large enough to arrive in several chunks must reach the
+        # callback exactly once each, in order.
+        chunks = []
+        response = self.fetch("/large_body", streaming_callback=chunks.append)
+        self.assertEqual(response.code, 200)
+        self.assertEqual(b"".join(chunks), large_body())
+        self.assertFalse(response.body)
+
+    def test_streaming_decompression_bomb(self):
+        # A malicious server can turn a small compressed response into a
+        # large decompressed one. With a streaming_callback it must be
+        # possible to consume the whole thing. (Upstream also bounds the
+        # peak memory with tracemalloc, which Python 2 lacks; that the
+        # client holds no more than a bounded amount at a time is covered
+        # by CurlStreamingBufferTest.)
+        received = [0]
+
+        def streaming_callback(chunk):
+            received[0] += len(chunk)
+
+        response = self.fetch("/gzip_bomb", streaming_callback=streaming_callback)
+        self.assertEqual(response.code, 200)
+        self.assertEqual(received[0], GZIP_BOMB_SIZE)
+        self.assertFalse(response.body)
+
     def test_post(self):
         response = self.fetch("/post", method="POST",
                               body="arg1=foo&arg2=bar")
@@ -182,8 +300,13 @@ class HTTPClientCommonTestCase(AsyncHTTPTestCase):
         self.assertEqual(response.body, b"asdfqwer")
 
         chunks = []
-        response = self.fetch("/chunk",
-                              streaming_callback=chunks.append)
+
+        def streaming_callback(chunk):
+            chunks.append(chunk)
+            self.first_chunk_received.set()
+
+        response = self.fetch("/chunk?wait=1",
+                              streaming_callback=streaming_callback)
         self.assertEqual(chunks, [b"asdf", b"qwer"])
         self.assertFalse(response.body)
 
@@ -228,12 +351,13 @@ Transfer-Encoding: chunked
 
         def streaming_cb(chunk):
             chunks.append(chunk)
+            self.first_chunk_received.set()
             if chunk == b'qwer':
                 1 / 0
 
         with ignore_deprecation():
             with ExceptionStackContext(error_handler):
-                self.fetch('/chunk', streaming_callback=streaming_cb)
+                self.fetch('/chunk?wait=1', streaming_callback=streaming_cb)
 
         self.assertEqual(chunks, [b'asdf', b'qwer'])
         self.assertEqual(1, len(exc_info))
@@ -345,8 +469,9 @@ Transfer-Encoding: chunked
             # comes in.
             self.assertEqual(headers['content-type'], 'text/html; charset=UTF-8')
             chunks.append(chunk)
+            self.first_chunk_received.set()
 
-        self.fetch('/chunk', header_callback=header_callback,
+        self.fetch('/chunk?wait=1', header_callback=header_callback,
                    streaming_callback=streaming_callback)
         self.assertEqual(len(first_line), 1, first_line)
         self.assertRegexpMatches(first_line[0], 'HTTP/[0-9]\\.[0-9] 200.*\r\n')
@@ -397,8 +522,13 @@ Transfer-Encoding: chunked
                     (resp.body, value, container))
 
     def test_multi_line_headers(self):
-        # Multi-line http headers are rare but rfc-allowed
-        # http://www.w3.org/Protocols/rfc2616/rfc2616-sec4.html#sec4.2
+        # Line folding is an obsolete way of representing headers split across multiple lines.
+        # https://tools.ietf.org/html/rfc7230#section-3.2.4
+        #
+        # The spec requires user agents to unfold them or reject the message.
+        # Both clients reject them as of 5.1.1.post3 (GHSA-pcg2-g6cj-q92c);
+        # what matters is that the client fails promptly instead of hanging
+        # until its timeout, and doesn't misparse the header.
         sock, port = bind_unused_port()
         with closing(sock):
             @gen.coroutine
@@ -416,10 +546,14 @@ X-XSS-Protection: 1;
                 stream.close()
 
             netutil.add_accept_handler(sock, accept_callback)
-            resp = self.fetch("http://127.0.0.1:%d/" % port)
-            resp.rethrow()
-            self.assertEqual(resp.headers['X-XSS-Protection'], "1; mode=block")
-            self.io_loop.remove_handler(sock.fileno())
+            try:
+                with ExpectLog(self.malformed_message_log,
+                               "Malformed HTTP message.*folding"):
+                    with self.assertRaises(HTTPError) as cm:
+                        self.fetch("http://127.0.0.1:%d/" % port, raise_error=True)
+                self.assertEqual(cm.exception.code, 599)
+            finally:
+                self.io_loop.remove_handler(sock.fileno())
 
     def test_304_with_content_length(self):
         # According to the spec 304 responses SHOULD NOT include
@@ -562,6 +696,54 @@ X-XSS-Protection: 1;
 
         for k, v in response.time_info.items():
             self.assertTrue(0 <= v < 1.0, "time_info[%s] out of bounds: %s" % (k, v))
+
+    def test_strip_headers_on_redirect(self):
+        # CVE-2026-49853: ensure that headers that should be stripped on
+        # cross-origin redirects are stripped, even if the redirect is to a
+        # different port on localhost.
+        test_cases = [
+            ("manual auth header", dict(headers={"Authorization": "secret"}), ""),
+            ("credentials in URL", dict(), "me:secret"),
+            ("auth parameters", dict(auth_username="me", auth_password="secret"), ""),
+            ("manual cookie header", dict(headers={"Cookie": "secret"}), ""),
+        ]
+        for name, kwargs, url_creds in test_cases:
+            for origin, target in (("different", self.get_url2), ("same", self.get_url)):
+                msg = "%s, %s origin" % (name, origin)
+                url = self.get_url(
+                    "/redirect?url=%s&status=302" % target("/echo_headers"))
+                if url_creds:
+                    url = url.replace("http://", "http://%s@" % url_creds)
+                response = self.fetch(url, **kwargs)
+                response.rethrow()
+                echoed_headers = json_decode(response.body)
+                # Confirm that non-auth headers are getting through.
+                # (Upstream checks User-Agent, which 5.1.1's simple client
+                # does not send by default.)
+                self.assertIn("Host", echoed_headers, msg)
+                if origin == "different":
+                    # Auth headers are stripped, however they were set.
+                    self.assertNotIn("Authorization", echoed_headers, msg)
+                    self.assertNotIn("Cookie", echoed_headers, msg)
+                else:
+                    # Auth headers are not stripped when the redirect is
+                    # same-origin. Each of our tests uses one of these
+                    # headers, but not both.
+                    self.assertTrue(
+                        "Authorization" in echoed_headers or "Cookie" in echoed_headers,
+                        msg)
+
+    def test_redirect_does_not_modify_original_headers(self):
+        # The redirected request is a shallow copy of the original, so
+        # stripping auth headers for a cross-origin redirect must happen on
+        # a copy of the headers, not on the caller's request.
+        request = HTTPRequest(
+            self.get_url("/redirect?url=%s&status=302" % self.get_url2("/echo_headers")),
+            headers={"Authorization": "secret"})
+        response = self.io_loop.run_sync(
+            lambda: self.http_client.fetch(request, raise_error=False))
+        response.rethrow()
+        self.assertEqual(request.headers.get("Authorization"), "secret")
 
 
 class RequestProxyTest(unittest.TestCase):
@@ -716,3 +898,123 @@ class HTTPErrorTestCase(unittest.TestCase):
         e = cm.exception
         self.assertEqual(str(e), "HTTP 403: Forbidden")
         self.assertEqual(repr(e), "HTTP 403: Forbidden")
+
+
+# Limit used by `HTTPClientMaxBodySizeTestMixin`. Subclasses configure their
+# client with it.
+MAX_BODY_SIZE = 1024 * 64
+
+
+class MaxBodySizeSmallHandler(RequestHandler):
+    def get(self):
+        self.set_header("Content-Type", "application/octet-stream")
+        self.write(b"a" * MAX_BODY_SIZE)
+
+
+class MaxBodySizeLargeHandler(RequestHandler):
+    def get(self):
+        self.set_header("Content-Type", "application/octet-stream")
+        self.write(b"a" * (MAX_BODY_SIZE + 1))
+
+
+class BodyBearingRedirectHandler(RequestHandler):
+    """A redirect carrying a body of its own, larger than the limit.
+
+    Implementations differ here: libcurl discards the body of a redirect it
+    follows, while simple_httpclient applies ``max_body_size`` to every
+    response including the redirect, and so refuses this one before
+    following it.
+    """
+
+    def prepare(self):
+        self.write("x" * (MAX_BODY_SIZE * 2))
+        self.redirect("/small")
+
+
+class HTTPClientMaxBodySizeTestMixin(object):
+    """Tests for the limit on a response body held in memory
+    (CVE-2026-49855, GHSA-chx6-46f5-w4vp).
+
+    Without a ``streaming_callback`` the whole body is buffered, so a
+    response larger than the client is prepared to hold cannot be retrieved
+    at all -- it can only be refused. Mixed into an `.AsyncHTTPTestCase`
+    whose client is configured with `MAX_BODY_SIZE` (upstream's
+    abstract_base_test helper does not exist here).
+    """
+
+    # Format of the message the implementation logs to `.gen_log` when it
+    # refuses a body, or None if it does not log one. ``{reason}`` is filled
+    # in with why the body was refused.
+    refusal_log_format = None
+
+    def get_app(self):
+        return Application([
+            url("/small", MaxBodySizeSmallHandler),
+            url("/large", MaxBodySizeLargeHandler),
+            url("/bomb", GzipBombHandler),
+            url("/body_bearing_redirect", BodyBearingRedirectHandler),
+        ])
+
+    def assert_refused(self, path, reason, **fetch_kwargs):
+        if self.refusal_log_format is not None:
+            expect = ExpectLog(gen_log, self.refusal_log_format.format(reason=reason))
+        else:
+            expect = _NullContext()
+        with expect:
+            with self.assertRaises(HTTPError) as cm:
+                self.fetch(path, raise_error=True, **fetch_kwargs)
+        self.assertEqual(cm.exception.code, 599)
+
+    def assert_streaming_refused(self, path, reason):
+        received = [0]
+
+        def streaming_callback(chunk):
+            received[0] += len(chunk)
+
+        self.assert_refused(path, reason=reason, streaming_callback=streaming_callback)
+        # Nothing past the limit reached the callback.
+        self.assertLessEqual(received[0], MAX_BODY_SIZE)
+
+    def test_small_body(self):
+        # A body of exactly max_body_size is accepted.
+        response = self.fetch("/small")
+        response.rethrow()
+        self.assertEqual(response.body, b"a" * MAX_BODY_SIZE)
+
+    def test_large_body(self):
+        # One byte more is not.
+        self.assert_refused("/large", reason="Content-Length too long")
+
+    def test_decompressed_body_size(self):
+        # The limit is measured after decompression, so a compressed
+        # response cannot expand past it.
+        self.assert_refused("/bomb", reason="decompressed body too large")
+
+    def test_streaming_callback_over_limit(self):
+        # max_body_size applies to a streaming_callback as well as to a
+        # buffered response. It is a safeguard for applications that do not
+        # impose a limit of their own on what they do with the chunks
+        # (writing them to disk, say), so retrieving a response larger than
+        # this means raising the limit deliberately.
+        self.assert_streaming_refused("/large", reason="Content-Length too long")
+
+    def test_streaming_callback_decompressed_over_limit(self):
+        # As above, measured after decompression.
+        self.assert_streaming_refused("/bomb", reason="decompressed body too large")
+
+    def test_reuse_after_refusal(self):
+        # Refusing a body must not leave the client unable to make the next
+        # request. This matters most for curl_httpclient, which reuses a
+        # pool of curl handles.
+        self.assert_refused("/large", reason="Content-Length too long")
+        response = self.fetch("/small")
+        response.rethrow()
+        self.assertEqual(response.body, b"a" * MAX_BODY_SIZE)
+
+
+class _NullContext(object):
+    def __enter__(self):
+        pass
+
+    def __exit__(self, typ, value, tb):
+        pass

@@ -103,7 +103,7 @@ MacOS users should run:
 
 kwargs = {}
 
-version = "5.1.1+security.2"
+version = "5.1.1.post3"
 
 with open('README.rst') as f:
     kwargs['long_description'] = f.read()
@@ -172,6 +172,8 @@ setup(
             "templates/utf8.html",
             "test.crt",
             "test.key",
+            "client_cert.crt",
+            "client_cert.key",
         ],
     },
     author="Facebook",

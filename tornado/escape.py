@@ -106,6 +106,39 @@ def url_escape(value, plus=True):
     return quote(utf8(value))
 
 
+def _parse_qs_has_max_num_fields():
+    try:
+        _parse_qs('', max_num_fields=1)
+    except TypeError:
+        return False
+    return True
+
+
+# max_num_fields was added to parse_qs in Python 2.7.16 and 3.6.8.
+_PARSE_QS_HAS_MAX_NUM_FIELDS = _parse_qs_has_max_num_fields()
+
+
+def _parse_qs_limited(qs, keep_blank_values, strict_parsing, max_num_fields,
+                      **kwargs):
+    """Calls parse_qs, raising ValueError if ``qs`` has more than
+    ``max_num_fields`` fields, as parse_qs itself does when it supports the
+    argument. On an interpreter whose parse_qs predates the argument, the
+    fields are counted the way those versions split them (on both ``&``
+    and ``;``).
+    """
+    if max_num_fields is not None:
+        if _PARSE_QS_HAS_MAX_NUM_FIELDS:
+            kwargs['max_num_fields'] = max_num_fields
+        else:
+            if isinstance(qs, bytes):
+                num_fields = 1 + qs.count(b'&') + qs.count(b';')
+            else:
+                num_fields = 1 + qs.count(u'&') + qs.count(u';')
+            if max_num_fields < num_fields:
+                raise ValueError('Max number of fields exceeded')
+    return _parse_qs(qs, keep_blank_values, strict_parsing, **kwargs)
+
+
 # python 3 changed things around enough that we need two separate
 # implementations of url_unescape.  We also need our own implementation
 # of parse_qs since python 3's version insists on decoding everything.
@@ -133,7 +166,17 @@ if not PY3:
         else:
             return unicode_type(unquote(utf8(value)), encoding)
 
-    parse_qs_bytes = _parse_qs
+    def parse_qs_bytes(qs, keep_blank_values=False, strict_parsing=False,
+                       max_num_fields=None):
+        """Parses a query string like urlparse.parse_qs, but returns the
+        values as byte strings.
+
+        .. versionadded:: 5.1.1.post3
+           The ``max_num_fields`` argument. ValueError is raised if this
+           limit is exceeded.
+        """
+        return _parse_qs_limited(qs, keep_blank_values, strict_parsing,
+                                 max_num_fields)
 else:
     def url_unescape(value, encoding='utf-8', plus=True):
         """Decodes the given value from a URL.
@@ -162,18 +205,24 @@ else:
                        else urllib_parse.unquote)
             return unquote(to_basestring(value), encoding=encoding)
 
-    def parse_qs_bytes(qs, keep_blank_values=False, strict_parsing=False):
+    def parse_qs_bytes(qs, keep_blank_values=False, strict_parsing=False,
+                       max_num_fields=None):
         """Parses a query string like urlparse.parse_qs, but returns the
         values as byte strings.
 
         Keys still become type str (interpreted as latin1 in python3!)
         because it's too painful to keep them as byte strings in
         python3 and in practice they're nearly always ascii anyway.
+
+        .. versionadded:: 5.1.1.post3
+           The ``max_num_fields`` argument. ValueError is raised if this
+           limit is exceeded.
         """
         # This is gross, but python3 doesn't give us another way.
         # Latin1 is the universal donor of character encodings.
-        result = _parse_qs(qs, keep_blank_values, strict_parsing,
-                           encoding='latin1', errors='strict')
+        result = _parse_qs_limited(qs, keep_blank_values, strict_parsing,
+                                   max_num_fields,
+                                   encoding='latin1', errors='strict')
         encoded = {}
         for k, v in result.items():
             encoded[k] = [i.encode('latin1') for i in v]

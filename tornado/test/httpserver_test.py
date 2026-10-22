@@ -7,10 +7,12 @@ from tornado.http1connection import HTTP1Connection
 from tornado.httpclient import HTTPError
 from tornado.httpserver import HTTPServer
 from tornado.httputil import HTTPHeaders, HTTPMessageDelegate, HTTPServerConnectionDelegate, ResponseStartLine  # noqa: E501
+from tornado.httputil import HTTPInputError
 from tornado.iostream import IOStream
 from tornado.locks import Event
 from tornado.log import gen_log
 from tornado.netutil import ssl_options_to_context
+from tornado.routing import Router
 from tornado.simple_httpclient import SimpleAsyncHTTPClient
 from tornado.testing import AsyncHTTPTestCase, AsyncHTTPSTestCase, AsyncTestCase, ExpectLog, gen_test  # noqa: E501
 from tornado.test.util import unittest, skipOnTravis
@@ -408,6 +410,16 @@ class HTTPServerRawTest(AsyncHTTPTestCase):
             self.assertEqual(400, start_line.code)
             self.assertEqual('Bad Request', start_line.reason)
 
+    def test_too_many_query_arguments(self):
+        # GHSA-3hv7-mjh2-fv65: an over-limit query string is a malformed
+        # request (400), rejected before any handler runs.
+        query = "&".join("a=%d" % i for i in range(1001))
+        with ExpectLog(gen_log, '.*Max number of fields exceeded'):
+            self.stream.write(utf8('GET /echo?%s HTTP/1.1\r\n\r\n' % query))
+            read_stream_body(self.stream, self.stop)
+            start_line, headers, response = self.wait()
+            self.assertEqual(400, start_line.code)
+
     def test_malformed_first_line_log(self):
         with ExpectLog(gen_log, '.*Malformed HTTP request line'):
             self.stream.write(b'asdf\r\n\r\n')
@@ -722,6 +734,31 @@ class UnixSocketTest(AsyncTestCase):
         self.assertEqual(response, b"HTTP/1.1 400 Bad Request\r\n\r\n")
 
 
+class _InputErrorRouter(Router):
+    def find_handler(self, request, **kwargs):
+        raise HTTPInputError("rejected by router")
+
+
+class DelegateInputErrorTest(AsyncHTTPTestCase):
+    # An HTTPInputError raised by a delegate (here, while routing) means the
+    # request is malformed: it is answered with a 400 and logged at info
+    # level, not logged as an uncaught application exception.
+    def get_app(self):
+        return _InputErrorRouter()
+
+    def test_input_error_from_delegate(self):
+        stream = IOStream(socket.socket())
+        self.io_loop.run_sync(lambda: stream.connect(('127.0.0.1', self.get_http_port())))
+        try:
+            with ExpectLog(gen_log, '.*Malformed HTTP message.*rejected by router'):
+                stream.write(b'GET / HTTP/1.0\r\n\r\n')
+                read_stream_body(stream, self.stop)
+                start_line, headers, response = self.wait()
+            self.assertEqual(400, start_line.code)
+        finally:
+            stream.close()
+
+
 class KeepAliveTest(AsyncHTTPTestCase):
     """Tests various scenarios for HTTP 1.1 keep-alive support.
 
@@ -921,11 +958,16 @@ class GzipBaseTest(object):
 
 class GzipTest(GzipBaseTest, AsyncHTTPTestCase):
     def get_httpserver_options(self):
-        return dict(decompress_request=True)
+        return dict(decompress_request=True, max_body_size=100)
 
     def test_gzip(self):
         response = self.post_gzip('foo=bar')
         self.assertEquals(json_decode(response.body), {u'foo': [u'bar']})
+
+    def test_size_limit(self):
+        # CVE-2026-49855
+        with ExpectLog(gen_log, ".*decompressed body too large"):
+            self.post_gzip("x" * 101)
 
 
 class GzipUnsupportedTest(GzipBaseTest, AsyncHTTPTestCase):
@@ -1012,9 +1054,10 @@ class StreamingChunkSizeTest(AsyncHTTPTestCase):
         def body_producer(write):
             write(self.BODY[:20])
             write(self.BODY[20:])
-        chunks = self.fetch_chunk_sizes(body_producer=body_producer)
-        # HTTP chunk boundaries translate to application-visible breaks
-        self.assertEqual([16, 4, 16, 14], chunks)
+        # HTTP chunk boundaries are not preserved: small chunks may be
+        # coalesced (GHSA-r4j5-9xpp-3985), so the assertions in
+        # fetch_chunk_sizes are as specific as we can get.
+        self.fetch_chunk_sizes(body_producer=body_producer)
 
     def test_chunked_compressed(self):
         compressed = self.compress(self.BODY)

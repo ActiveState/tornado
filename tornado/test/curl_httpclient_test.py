@@ -1,15 +1,22 @@
 # coding: utf-8
 from __future__ import absolute_import, division, print_function
 
+import gc
+import logging
 from hashlib import md5
+import os
+import ssl
+import weakref
 
+from tornado import gen
 from tornado.escape import utf8
 from tornado.httpclient import HTTPRequest, HTTPClientError
 from tornado.locks import Event
+from tornado.netutil import ssl_options_to_context
 from tornado.stack_context import ExceptionStackContext
-from tornado.testing import AsyncHTTPTestCase, gen_test
+from tornado.testing import AsyncHTTPTestCase, AsyncHTTPSTestCase, AsyncTestCase, gen_test
 from tornado.test import httpclient_test
-from tornado.test.util import unittest, ignore_deprecation
+from tornado.test.util import unittest, ignore_deprecation, skipNotCPython
 from tornado.web import Application, RequestHandler
 
 
@@ -18,17 +25,117 @@ try:
 except ImportError:
     pycurl = None
 
+try:
+    from unittest import mock  # type: ignore
+except ImportError:
+    try:
+        import mock  # type: ignore
+    except ImportError:
+        mock = None
+
 if pycurl is not None:
-    from tornado.curl_httpclient import CurlAsyncHTTPClient
+    from tornado.curl_httpclient import (
+        CurlAsyncHTTPClient, CurlError, _CurlStreamingBuffer)
+
+
+def create_client(**kwargs):
+    return CurlAsyncHTTPClient(
+        force_instance=True, defaults=dict(allow_ipv6=False), **kwargs)
+
+
+def small_streaming_buffer():
+    # Shrink the pause threshold so one response pauses and resumes many
+    # times.
+    return mock.patch.object(_CurlStreamingBuffer, "max_buffer_size", 1024)
 
 
 @unittest.skipIf(pycurl is None, "pycurl module not present")
 class CurlHTTPClientCommonTestCase(httpclient_test.HTTPClientCommonTestCase):
+    malformed_message_log = logging.getLogger("tornado.curl_httpclient")
+
     def get_http_client(self):
         client = CurlAsyncHTTPClient(defaults=dict(allow_ipv6=False))
         # make sure AsyncHTTPClient magic doesn't give us the wrong class
         self.assertTrue(isinstance(client, CurlAsyncHTTPClient))
         return client
+
+    @unittest.skipIf(mock is None, "mock package not present")
+    def test_streaming_pause_and_resume(self):
+        # GHSA-chx6-46f5-w4vp. With a small buffer the transfer is paused
+        # and resumed many times over one response. libcurl re-delivers the
+        # chunk that was in flight when it was paused, so that chunk must
+        # not be consumed twice.
+        chunks = []
+        with small_streaming_buffer():
+            response = self.fetch("/large_body", streaming_callback=chunks.append)
+        self.assertEqual(response.code, 200)
+        self.assertEqual(b"".join(chunks), httpclient_test.large_body())
+
+    @unittest.skipIf(mock is None, "mock package not present")
+    def test_concurrent_paused_streams(self):
+        # Several streaming requests in flight at once, each pausing and
+        # resuming repeatedly: pausing one transfer must not disturb another.
+        client = create_client(max_clients=4)
+        buffers = [bytearray() for _ in range(8)]
+        try:
+            with small_streaming_buffer():
+                self.io_loop.run_sync(lambda: gen.multi([
+                    client.fetch(self.get_url("/large_body"),
+                                 streaming_callback=buf.extend)
+                    for buf in buffers
+                ]))
+        finally:
+            client.close()
+        for buf in buffers:
+            self.assertEqual(bytes(buf), httpclient_test.large_body())
+
+    @skipNotCPython
+    def test_client_not_leaked_by_write_callbacks(self):
+        # The WRITEFUNCTION callbacks installed for both the buffered and
+        # the streaming path hold references to the client and to the curl
+        # handle. They must not keep the client alive after close().
+
+        def use_and_close_a_client():
+            client = create_client()
+            self.io_loop.run_sync(lambda: client.fetch(self.get_url("/hello")))
+            self.io_loop.run_sync(lambda: client.fetch(
+                self.get_url("/large_body"),
+                streaming_callback=lambda chunk: None))
+            client.close()
+            return weakref.ref(client)
+
+        ref = use_and_close_a_client()
+        gc.collect()
+        self.assertIsNone(ref())
+
+    @unittest.skipIf(mock is None, "mock package not present")
+    def test_streaming_callback_exception(self):
+        # An exception in the streaming_callback does not stop the transfer
+        # or leave it paused forever. Upstream expects it to be logged; here
+        # streaming_callback is wrapped in the caller's stack_context (as
+        # test_streaming_stack_context shows), so it is delivered there
+        # instead.
+        chunks = []
+        exc_info = []
+
+        def error_handler(typ, value, tb):
+            exc_info.append((typ, value, tb))
+            return True
+
+        def streaming_callback(chunk):
+            chunks.append(chunk)
+            if len(chunks) == 1:
+                raise ZeroDivisionError()
+
+        with small_streaming_buffer():
+            with ignore_deprecation():
+                with ExceptionStackContext(error_handler):
+                    response = self.fetch("/large_body",
+                                          streaming_callback=streaming_callback)
+        self.assertEqual(response.code, 200)
+        self.assertEqual(b"".join(chunks), httpclient_test.large_body())
+        self.assertEqual(len(exc_info), 1)
+        self.assertIs(exc_info[0][0], ZeroDivisionError)
 
 
 class DigestAuthHandler(RequestHandler):
@@ -151,3 +258,218 @@ class CurlHTTPClientTestCase(AsyncHTTPTestCase):
         response = self.fetch('/digest_non_ascii', auth_mode='digest',
                               auth_username='foo', auth_password='barユ£')
         self.assertEqual(response.body, b'ok')
+
+
+class ProxyAuthEchoHandler(RequestHandler):
+    def get(self):
+        if self.request.headers.get("Proxy-Authorization", None) is not None:
+            self.write("proxy auth: %s" % self.request.headers['Proxy-Authorization'])
+        else:
+            self.write("no proxy auth")
+
+
+@unittest.skipIf(pycurl is None, "pycurl module not present")
+class CurlHTTPClientReuseProxyAuthTestCase(AsyncHTTPTestCase):
+    # GHSA-pw6j-qg29-8w7f
+    def get_app(self):
+        # Note that we don't properly support proxy-style requests, but it works well enough
+        # for this test if we start the url matcher with a wildcard.
+        return Application([(".*/proxy_auth", ProxyAuthEchoHandler)])
+
+    def get_http_client(self):
+        # max_clients=1 forces us to reuse curl "easy handles". This is a regression test for
+        # a bug in which proxy credentials were not cleared between requests.
+        return CurlAsyncHTTPClient(
+            force_instance=True,
+            defaults=dict(
+                allow_ipv6=False,
+            ),
+            max_clients=1,
+        )
+
+    def test_reuse_proxy_credentials(self):
+        # Proxy credentials used on one request should not be automatically reused
+        # by another request.
+        response = self.fetch(
+            "/proxy_auth",
+            proxy_host="127.0.0.1",
+            proxy_port=self.get_http_port(),
+            proxy_username="foo",
+            proxy_password="bar",
+        )
+        self.assertEqual(response.body, b"proxy auth: Basic Zm9vOmJhcg==")
+        response = self.fetch(
+            "/proxy_auth",
+            proxy_host="127.0.0.1",
+            proxy_port=self.get_http_port(),
+        )
+        self.assertEqual(response.body, b"no proxy auth")
+
+
+class ClientCertEchoHandler(RequestHandler):
+    def get(self):
+        cert = self.request.get_ssl_certificate()
+        if cert:
+            assert isinstance(cert, dict)
+            # Echo just the commonName: the repr of the subject tuple differs
+            # between Python 2 (u'') and 3.
+            subject = dict(rdn[0] for rdn in cert['subject'])
+            self.write("client cert: %s" % subject['commonName'])
+        else:
+            self.write("no client cert")
+
+
+@unittest.skipIf(pycurl is None, "pycurl module not present")
+class CurlHTTPClientReuseCertsTestCase(AsyncHTTPSTestCase):
+    # GHSA-pw6j-qg29-8w7f. client_cert.crt/.key are upstream's current test
+    # pair; 5.1.1's own test.crt expired in 2020, so it cannot be verified
+    # as a client certificate.
+    def get_app(self):
+        return Application([(".*/client_cert", ClientCertEchoHandler)])
+
+    def get_http_client(self):
+        return CurlAsyncHTTPClient(
+            force_instance=True,
+            defaults=dict(
+                allow_ipv6=False,
+                validate_cert=False,
+            ),
+            max_clients=1,
+        )
+
+    def get_httpserver_options(self):
+        ssl_ctx = ssl_options_to_context(self.get_ssl_options())
+        ssl_ctx.verify_mode = ssl.CERT_OPTIONAL
+        return dict(ssl_options=ssl_ctx)
+
+    def get_ssl_options(self):
+        opts = super(CurlHTTPClientReuseCertsTestCase, self).get_ssl_options()
+        opts["ca_certs"] = os.path.join(os.path.dirname(__file__), "client_cert.crt")
+        return opts
+
+    def test_reuse_certs(self):
+        # Client certs used on one request should not be automatically reused
+        # by another request.
+        response = self.fetch(
+            self.get_url("/client_cert"),
+            client_cert=os.path.join(os.path.dirname(__file__), "client_cert.crt"),
+            client_key=os.path.join(os.path.dirname(__file__), "client_cert.key"),
+        )
+        self.assertEqual(
+            response.body, b"client cert: foo.example.com"
+        )
+        response = self.fetch(self.get_url("/client_cert"))
+        self.assertEqual(response.body, b"no client cert")
+
+
+@unittest.skipIf(pycurl is None, "pycurl module not present")
+class CurlHTTPClientMaxBodySizeTestCase(httpclient_test.HTTPClientMaxBodySizeTestMixin,
+                                        AsyncHTTPTestCase):
+    # GHSA-chx6-46f5-w4vp. curl_httpclient does not log when it refuses a
+    # body; the message is carried by the CurlError instead.
+    def get_http_client(self):
+        # max_clients=1 so that each test also reuses the curl handle left
+        # behind by the one before it.
+        return create_client(max_body_size=httpclient_test.MAX_BODY_SIZE, max_clients=1)
+
+    def test_refusal_message(self):
+        # The generic test only checks that the body was refused; make sure
+        # the error says why, since libcurl's own message for a short write
+        # ("Failure writing output to destination") would not.
+        with self.assertRaises(CurlError) as cm:
+            self.fetch("/bomb", raise_error=True)
+        self.assertIn("max_body_size", str(cm.exception))
+
+    def test_redirect_body_not_counted(self):
+        # libcurl discards the body of a redirect that it follows, so a
+        # redirect carrying a large body of its own does not count towards
+        # the limit for the response that follows it. Not shared:
+        # simple_httpclient applies max_body_size to the redirect response
+        # too, and refuses this one before following it.
+        response = self.fetch("/body_bearing_redirect")
+        response.rethrow()
+        self.assertEqual(response.body, b"a" * httpclient_test.MAX_BODY_SIZE)
+
+
+@unittest.skipIf(pycurl is None, "pycurl module not present")
+@unittest.skipIf(mock is None, "mock package not present")
+class CurlStreamingBufferTest(AsyncTestCase):
+    """Unit tests for the buffer that feeds a ``streaming_callback``."""
+
+    def setUp(self):
+        super(CurlStreamingBufferTest, self).setUp()
+        self.timeouts_requested = []
+        test = self
+
+        class FakeClient(object):
+            io_loop = test.io_loop
+            max_body_size = 1024 * 1024
+
+            def _set_timeout(self, msecs):
+                test.timeouts_requested.append(msecs)
+
+        self.client = FakeClient()
+
+    def make_buffer(self, curl, callback):
+        return _CurlStreamingBuffer(self.client, curl, callback)
+
+    def test_unpause_asks_for_a_socket_action(self):
+        # Only libcurl 7.69+ reports through the timer callback that an
+        # unpaused transfer is runnable again; older versions leave it
+        # stalled unless we ask for a socket_action ourselves.
+        paused = []
+
+        class FakeCurl(object):
+            def pause(self, flags):
+                paused.append(flags)
+
+        chunks = []
+        buf = self.make_buffer(FakeCurl(), chunks.append)
+        with mock.patch.object(_CurlStreamingBuffer, "max_buffer_size", 4):
+            self.assertEqual(buf.write(b"hello"), 5)
+            self.assertEqual(buf.write(b"world"), pycurl.WRITEFUNC_PAUSE)
+        buf.flush()
+        self.assertEqual(chunks, [b"hello"])
+        self.assertEqual(paused, [pycurl.PAUSE_CONT])
+        self.assertEqual(self.timeouts_requested, [0])
+
+    def test_body_too_large(self):
+        # Exceeding the client's max_body_size makes write() report a short
+        # write, which libcurl turns into a failed transfer, and records why
+        # so that _finish can say so.
+        class FakeCurl(object):
+            def pause(self, flags):
+                raise AssertionError("should not pause")
+
+        chunks = []
+        buf = self.make_buffer(FakeCurl(), chunks.append)
+        self.client.max_body_size = 8
+        self.assertEqual(buf.write(b"12345"), 5)
+        self.assertFalse(buf.body_too_large)
+        # 5 + 5 > 8, so this chunk is refused rather than truncated.
+        self.assertEqual(buf.write(b"67890"), 0)
+        self.assertTrue(buf.body_too_large)
+        buf.flush()
+        self.assertEqual(chunks, [b"12345"])
+
+    def test_unpause_error_is_ignored(self):
+        # When a transfer fails while it is paused, libcurl reports the
+        # failure from curl_easy_pause instead of from the write callback.
+        # That is not an error in the flush itself, and must not be raised
+        # into the IOLoop: _finish will pass the failure to the callback.
+        class FakeCurl(object):
+            def pause(self, flags):
+                raise pycurl.error(pycurl.E_WRITE_ERROR, "write error")
+
+        chunks = []
+        buf = self.make_buffer(FakeCurl(), chunks.append)
+        with mock.patch.object(_CurlStreamingBuffer, "max_buffer_size", 4):
+            self.assertEqual(buf.write(b"hello"), 5)
+            # The buffer is full, so this chunk is left with libcurl.
+            self.assertEqual(buf.write(b"world"), pycurl.WRITEFUNC_PAUSE)
+        self.assertTrue(buf.paused)
+        buf.flush()
+        self.assertEqual(chunks, [b"hello"])
+        self.assertFalse(buf.paused)
+        # A failed unpause is not worth a socket_action.
+        self.assertEqual(self.timeouts_requested, [])

@@ -1,0 +1,128 @@
+What's new in Tornado 5.1.1.post3
+=================================
+
+Oct 22, 2026
+------------
+
+This is a Python 2 compatible patch release backporting security fixes
+from Tornado 6.5.3 through 6.6.0. It is cumulative: it contains every fix
+in 5.1.1.1 and 5.1.1+security.2.
+
+Every advisory listed below affects Tornado 5.1.1 (the vulnerable code is
+present) and is fixed in this release. None was assessed as not
+applicable.
+
+Security fixes
+~~~~~~~~~~~~~~
+
+- **CVE-2025-67724** (``GHSA-pr2v-jx2c-wg9f``) -- fixed. A ``reason``
+  argument to ``RequestHandler.set_status`` or ``HTTPError`` that is not a
+  valid HTTP reason phrase (or contains ``<``) is replaced with
+  ``Unknown``, and the default error page escapes it. This prevents header
+  injection and XSS.
+- **CVE-2025-67725** (``GHSA-c98p-7wgm-6p64``) -- fixed. Repeated header
+  lines are combined lazily, so ``HTTPHeaders.add`` is linear instead of
+  quadratic.
+- **CVE-2025-67726** (``GHSA-jhmp-mqwm-3gq8``) -- fixed. Parsing header
+  parameters (``Content-Disposition``, ``Sec-WebSocket-Extensions``) with
+  many quoted semicolons is linear instead of quadratic.
+- **CVE-2026-49853** (``GHSA-3x9g-8vmp-wqvf``) -- fixed.
+  ``SimpleAsyncHTTPClient`` strips the ``Authorization`` and ``Cookie``
+  headers and any credentials when following a redirect that changes the
+  scheme, host or port.
+- **CVE-2026-49854** (``GHSA-cx3h-4qpv-8hc9``) -- fixed. The
+  ``tornado.speedups`` C extension (and the pure-Python fallback) reject a
+  websocket mask that is not exactly 4 bytes, instead of reading past the
+  end of the buffer.
+- **CVE-2026-49855** (``GHSA-mgf9-4vpg-hj56``) -- fixed. ``max_body_size``
+  is enforced on the decompressed size of gzip-encoded bodies, in both
+  ``SimpleAsyncHTTPClient`` and ``HTTPServer(decompress_request=True)``.
+- ``GHSA-pw6j-qg29-8w7f`` -- fixed. ``CurlAsyncHTTPClient`` fully resets
+  each curl handle before reusing it, so client certificates and proxy
+  credentials no longer leak to later requests.
+- ``GHSA-8423-8fgw-73vq`` -- fixed. A ``multipart/form-data`` body with too
+  many parts is rejected without first splitting it into every part.
+- **CVE-2026-82397** (``GHSA-mpf4-983q-p7j4``) -- fixed.
+  ``application/x-www-form-urlencoded`` bodies are limited to 1000
+  arguments.
+- ``GHSA-3hv7-mjh2-fv65`` -- fixed. The same 1000-argument limit applies to
+  the query string. An over-limit request gets a 400.
+- ``GHSA-c2m8-h5v5-343r`` -- fixed. ``StaticFileHandler`` no longer follows
+  symlinks out of the static directory. The new ``allowed_symlink_directory``
+  argument (a directory or a list) opts in to serving symlink targets
+  elsewhere.
+- ``GHSA-chx6-46f5-w4vp`` -- fixed. ``CurlAsyncHTTPClient`` takes a
+  ``max_body_size`` argument (default 100MB, as for
+  ``simple_httpclient``), enforced on the decompressed size of every
+  response, and pauses the transfer when a ``streaming_callback`` falls
+  behind. A decompression bomb can no longer exhaust memory.
+- ``GHSA-wwv5-g3v4-889x`` -- fixed. Every attribute passed to
+  ``set_cookie`` through keyword arguments (including capitalized forms such
+  as ``Domain=``) is checked for control characters, ``DEL`` and ``;``. This
+  closes the gap left by the CVE-2026-35536 fix.
+- ``GHSA-c6v4-qj2h-f748`` -- fixed. ``set_cookie``'s ``max_age`` is
+  converted with ``int()``, so a non-numeric value raises ``ValueError``
+  instead of injecting cookie attributes.
+- ``GHSA-pw9p-v7r6-gx4p`` -- fixed. ``RedirectHandler`` returns a 400 if
+  the substituted values would change the scheme or host of the redirect
+  (open redirect). The protocol-relative check in ``StaticFileHandler``
+  also catches backslash and whitespace variants.
+- ``GHSA-pcg2-g6cj-q92c`` -- fixed. Obsolete line folding in HTTP headers
+  is no longer supported (see below), which removes its quadratic parsing
+  cost.
+- ``GHSA-r4j5-9xpp-3985`` -- fixed. Body reading yields to the IOLoop
+  periodically and coalesces small chunks, so a chunked body made of many
+  tiny chunks no longer blocks the event loop or uses excessive memory.
+- ``GHSA-v8g8-cp5j-42fg`` -- fixed. ``static_url()`` (``get_version``)
+  rejects paths outside ``static_path`` with a 403, never reads anything
+  but a regular file, stops hashing at ``MAX_VERSION_CONTENT_SIZE``
+  (64MB), and keeps at most ``MAX_CACHED_VERSIONS`` (10000) versions.
+
+Other security improvements
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+These are listed among the security fixes in Tornado 6.5.9 but have no
+advisory of their own:
+
+- ``SimpleAsyncHTTPClient`` enforces ``max_body_size`` on responses read
+  until the connection closes (no ``Content-Length`` or
+  ``Transfer-Encoding``). Previously such a body was unbounded, and one
+  larger than the read buffer was not reported as an error.
+- ``SimpleAsyncHTTPClient`` rejects a response preceded by more than 10
+  informational (``1xx``) responses, and no longer processes the response
+  that follows a ``100 Continue`` twice.
+
+Behavior changes
+~~~~~~~~~~~~~~~~
+
+Most of these fixes reject input that was previously accepted. In
+particular:
+
+- A header line that begins with whitespace (obsolete line folding) is
+  rejected: the server answers 400, and both HTTP clients fail the request
+  with a 599 error. RFC 7230 section 3.2.4 permits this, and Tornado 6.6
+  does the same.
+- Query strings and urlencoded bodies with more than 1000 arguments are
+  rejected. The limit is the module-level constant
+  ``tornado.httputil._URLENCODED_MAX_ARGUMENTS``.
+- ``CurlAsyncHTTPClient`` refuses responses whose decompressed size is
+  larger than ``max_body_size`` (100MB by default), including streamed
+  responses. Pass a larger ``max_body_size`` to retrieve them.
+- ``StaticFileHandler`` returns 403 for a symlink that resolves outside
+  the static directory unless ``allowed_symlink_directory`` covers the
+  target.
+- ``RequestHandler.static_url`` raises ``HTTPError(403)`` for a path
+  outside ``static_path``.
+- ``RedirectHandler`` substitutions can no longer form the scheme or host
+  of the destination URL.
+- The pieces passed to ``data_received`` (including
+  ``@stream_request_body`` handlers) no longer correspond to HTTP chunk
+  boundaries.
+
+.. note::
+
+   Fixed in earlier releases of this line, and still fixed here:
+   ``GHSA-hj3f-6gcp-jg8j`` (CVE-2023-28370) in 5.1.1.1; CVE-2024-52804,
+   CVE-2025-47287, CVE-2026-31958, CVE-2026-35536, ``GHSA-78cv-mqj4-43f7``,
+   ``GHSA-753j-mpmx-qq6g``, ``GHSA-qppv-j76h-2rpx`` and
+   ``GHSA-w235-7p84-xx57`` in 5.1.1+security.2.

@@ -77,6 +77,12 @@ _CRLF_RE = re.compile(r'\r?\n')
 # with a proxy's parsing and enables request smuggling (GHSA-753j-mpmx-qq6g).
 HTTP_WHITESPACE = " \t"
 
+# RFC 7230 section 3.1.2: reason-phrase = *( HTAB / SP / VCHAR / obs-text ).
+# set_status() falls back to "Unknown" for anything else, so an untrusted
+# reason cannot inject headers or markup (CVE-2025-67724). Anchored with \Z
+# because re.fullmatch is not available on Python 2.7.
+_REASON_PHRASE_RE = re.compile(r"[\t \x21-\x7e\x80-\xff]+\Z")
+
 
 class _NormalizedHeaderCache(dict):
     """Dynamic cached mapping of header names to Http-Header-Case.
@@ -139,9 +145,15 @@ class HTTPHeaders(collections.MutableMapping):
     Set-Cookie: C=D
     """
     def __init__(self, *args, **kwargs):
-        self._dict = {}  # type: typing.Dict[str, str]
+        # Formally, HTTP headers are a mapping from a field name to a "combined field value",
+        # which may be constructed from multiple field lines by joining them with commas.
+        # In practice, however, some headers (notably Set-Cookie) do not follow this convention,
+        # so we maintain a mapping from field name to a list of field lines in self._as_list.
+        # self._combined_cache is a cache of the combined field values derived from self._as_list
+        # on demand (and cleared whenever the list is modified). Joining lazily keeps
+        # repeated header lines linear rather than quadratic (CVE-2025-67725).
         self._as_list = {}  # type: typing.Dict[str, typing.List[str]]
-        self._last_key = None
+        self._combined_cache = {}  # type: typing.Dict[str, str]
         if (len(args) == 1 and len(kwargs) == 0 and
                 isinstance(args[0], HTTPHeaders)):
             # Copy constructor
@@ -157,10 +169,8 @@ class HTTPHeaders(collections.MutableMapping):
         # type: (str, str) -> None
         """Adds a new value for the given key."""
         norm_name = _normalized_headers[name]
-        self._last_key = norm_name
         if norm_name in self:
-            self._dict[norm_name] = (native_str(self[norm_name]) + ',' +
-                                     native_str(value))
+            self._combined_cache.pop(norm_name, None)
             self._as_list[norm_name].append(value)
         else:
             self[norm_name] = value
@@ -188,20 +198,22 @@ class HTTPHeaders(collections.MutableMapping):
         >>> h.parse_line("Content-Type: text/html")
         >>> h.get('content-type')
         'text/html'
+
+        .. versionchanged:: 5.1.1.post3
+           Obsolete line folding (a header line beginning with whitespace,
+           continuing the previous one) is no longer supported and raises
+           `HTTPInputError`. Appending each continuation took quadratic time
+           (GHSA-pcg2-g6cj-q92c); RFC 7230 section 3.2.4 allows rejecting
+           obs-fold, and tornado 6.6 removed it the same way.
         """
         if line[0].isspace():
-            # continuation of a multi-line header
-            if self._last_key is None:
-                raise HTTPInputError("first header line cannot start with whitespace")
-            new_part = ' ' + line.lstrip(HTTP_WHITESPACE)
-            self._as_list[self._last_key][-1] += new_part
-            self._dict[self._last_key] += new_part
-        else:
-            try:
-                name, value = line.split(":", 1)
-            except ValueError:
-                raise HTTPInputError("no colon in header line")
-            self.add(name, value.strip(HTTP_WHITESPACE))
+            raise HTTPInputError(
+                "header line cannot start with whitespace, folding not supported")
+        try:
+            name, value = line.split(":", 1)
+        except ValueError:
+            raise HTTPInputError("no colon in header line")
+        self.add(name, value.strip(HTTP_WHITESPACE))
 
     @classmethod
     def parse(cls, headers):
@@ -227,23 +239,39 @@ class HTTPHeaders(collections.MutableMapping):
 
     def __setitem__(self, name, value):
         norm_name = _normalized_headers[name]
-        self._dict[norm_name] = value
+        self._combined_cache[norm_name] = value
         self._as_list[norm_name] = [value]
+
+    def __contains__(self, name):
+        # This is an important optimization to avoid the expensive concatenation
+        # in __getitem__ when it's not needed.
+        if not isinstance(name, (str, unicode_type)):
+            return False
+        norm_name = _normalized_headers[name]
+        return norm_name in self._as_list
 
     def __getitem__(self, name):
         # type: (str) -> str
-        return self._dict[_normalized_headers[name]]
+        header = _normalized_headers[name]
+        if header not in self._combined_cache:
+            values = self._as_list[header]
+            if len(values) == 1:
+                self._combined_cache[header] = values[0]
+            else:
+                self._combined_cache[header] = ','.join(
+                    native_str(v) for v in values)
+        return self._combined_cache[header]
 
     def __delitem__(self, name):
         norm_name = _normalized_headers[name]
-        del self._dict[norm_name]
+        self._combined_cache.pop(norm_name, None)
         del self._as_list[norm_name]
 
     def __len__(self):
-        return len(self._dict)
+        return len(self._as_list)
 
     def __iter__(self):
-        return iter(self._dict)
+        return iter(self._as_list)
 
     def copy(self):
         # defined in dict but not in MutableMapping.
@@ -380,7 +408,17 @@ class HTTPServerRequest(object):
         self._finish_time = None
 
         self.path, sep, self.query = uri.partition('?')
-        self.arguments = parse_qs_bytes(self.query, keep_blank_values=True)
+        try:
+            self.arguments = parse_qs_bytes(
+                self.query,
+                keep_blank_values=True,
+                # The query string is bounded by max_header_size, but parsing
+                # is expensive enough per field to be worth limiting. Use the
+                # same limit as a urlencoded body (GHSA-3hv7-mjh2-fv65).
+                max_num_fields=_URLENCODED_MAX_ARGUMENTS,
+            )
+        except Exception as e:
+            raise HTTPInputError("Invalid query string: %s" % e)
         self.query_arguments = copy.deepcopy(self.arguments)
         self.body_arguments = {}
 
@@ -762,7 +800,9 @@ def parse_body_arguments(content_type, body, arguments, files, headers=None):
         return
     if content_type.startswith("application/x-www-form-urlencoded"):
         try:
-            uri_arguments = parse_qs_bytes(native_str(body), keep_blank_values=True)
+            uri_arguments = parse_qs_bytes(
+                native_str(body), keep_blank_values=True,
+                max_num_fields=_URLENCODED_MAX_ARGUMENTS)
         except Exception as e:
             gen_log.warning('Invalid x-www-form-urlencoded body: %s', e)
             uri_arguments = {}
@@ -790,6 +830,13 @@ def parse_body_arguments(content_type, body, arguments, files, headers=None):
 _MULTIPART_MAX_PARTS = 1000
 _MULTIPART_MAX_PART_HEADER_SIZE = 10 * 1024
 
+# CVE-2026-82397: the maximum number of arguments parsed from an
+# application/x-www-form-urlencoded body. Parsing cost grows superlinearly
+# with the field count, so an unbounded body of separators could stall the
+# event loop. 1000 is upstream's default (also used by php and node.js);
+# like the multipart limits it is module-level so it can be raised.
+_URLENCODED_MAX_ARGUMENTS = 1000
+
 
 def parse_multipart_form_data(boundary, data, arguments, files):
     """Parses a ``multipart/form-data`` body.
@@ -816,7 +863,10 @@ def parse_multipart_form_data(boundary, data, arguments, files):
         # of logging per malformed part, which let a crafted body flood the
         # logs and block the event loop.
         raise HTTPInputError("Invalid multipart/form-data: no final boundary")
-    parts = data[:final_boundary_index].split(b"--" + boundary + b"\r\n")
+    # GHSA-8423-8fgw-73vq: cap the split so a body with a huge number of parts
+    # is rejected without first materializing every part as a separate copy.
+    parts = data[:final_boundary_index].split(
+        b"--" + boundary + b"\r\n", _MULTIPART_MAX_PARTS + 1)
     if len(parts) > _MULTIPART_MAX_PARTS:
         raise HTTPInputError(
             "multipart/form-data has too many parts (>%d)" %
@@ -917,19 +967,29 @@ def parse_response_start_line(line):
 # It has also been modified to support valueless parameters as seen in
 # websocket extension negotiations, and to support non-ascii values in
 # RFC 2231/5987 format.
+#
+# _parseparam has been further modified with the logic from
+# https://github.com/python/cpython/pull/136072/files
+# to avoid quadratic behavior when parsing semicolons in quoted strings
+# (CVE-2025-67726).
 
 
 def _parseparam(s):
-    while s[:1] == ';':
-        s = s[1:]
-        end = s.find(';')
-        while end > 0 and (s.count('"', 0, end) - s.count('\\"', 0, end)) % 2:
-            end = s.find(';', end + 1)
+    start = 0
+    while s.find(';', start) == start:
+        start += 1
+        end = s.find(';', start)
+        ind, diff = start, 0
+        while end > 0:
+            diff += s.count('"', ind, end) - s.count('\\"', ind, end)
+            if diff % 2 == 0:
+                break
+            end, ind = ind, s.find(';', end + 1)
         if end < 0:
             end = len(s)
-        f = s[:end]
+        f = s[start:end]
         yield f.strip()
-        s = s[end:]
+        start = end
 
 
 def _parse_header(line):

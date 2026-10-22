@@ -5,6 +5,7 @@ from tornado.httputil import (
     url_concat, parse_multipart_form_data, HTTPHeaders, format_timestamp,
     HTTPServerRequest, parse_request_start_line, parse_cookie, qs_to_qsl,
     HTTPInputError, _MULTIPART_MAX_PARTS, _MULTIPART_MAX_PART_HEADER_SIZE,
+    _parse_header, parse_body_arguments, _URLENCODED_MAX_ARGUMENTS,
 )
 from tornado.escape import utf8, native_str
 from tornado.util import PY3
@@ -14,6 +15,7 @@ from tornado.test.util import unittest
 
 import copy
 import datetime
+import gc
 import logging
 import pickle
 import time
@@ -121,6 +123,31 @@ class QsParseTest(unittest.TestCase):
         self.assertIn(('b', '2'), qsl)
 
 
+class UrlEncodedDataTest(unittest.TestCase):
+    def test_urlencoded_data(self):
+        data = b"a=1&b=2&a=3"
+        args, files = {}, {}
+        parse_body_arguments("application/x-www-form-urlencoded", data, args, files)
+        self.assertEqual(args["a"], [b"1", b"3"])
+        self.assertEqual(args["b"], [b"2"])
+        self.assertEqual(files, {})
+
+    def test_max_arguments(self):
+        # CVE-2026-82397. Upstream raises HTTPInputError here; 5.1.1's
+        # parse_body_arguments logs malformed bodies and parses nothing.
+        data = b"".join(b"a=1&" for _ in range(_URLENCODED_MAX_ARGUMENTS + 1))
+        args, files = {}, {}
+        with ExpectLog(gen_log, ".*Max number of fields exceeded"):
+            parse_body_arguments("application/x-www-form-urlencoded", data, args, files)
+        self.assertEqual(args, {})
+
+    def test_max_arguments_boundary(self):
+        data = b"&".join(b"a=1" for _ in range(_URLENCODED_MAX_ARGUMENTS))
+        args, files = {}, {}
+        parse_body_arguments("application/x-www-form-urlencoded", data, args, files)
+        self.assertEqual(len(args["a"]), _URLENCODED_MAX_ARGUMENTS)
+
+
 class MultipartFormDataTest(unittest.TestCase):
     def test_file_upload(self):
         data = b"""\
@@ -225,6 +252,23 @@ Foo
         with self.assertRaises(HTTPInputError):
             parse_multipart_form_data(b"1234", data, {}, {})
 
+    def test_max_parts_boundary(self):
+        # GHSA-8423-8fgw-73vq: the split is capped at _MULTIPART_MAX_PARTS + 1
+        # so an oversized body is rejected without building every part. The
+        # cap must not move the limit: the empty chunk before the first
+        # boundary counts towards it, so _MULTIPART_MAX_PARTS - 1 real parts
+        # is the largest body accepted, both before and after the cap.
+        part = (b"--1234\r\nContent-Disposition: form-data; name=a\r\n"
+                b"\r\nv\r\n")
+        args = {}
+        data = part * (_MULTIPART_MAX_PARTS - 1) + b"--1234--"
+        parse_multipart_form_data(b"1234", data, args, {})
+        self.assertEqual(len(args["a"]), _MULTIPART_MAX_PARTS - 1)
+        for n in (_MULTIPART_MAX_PARTS, 100 * _MULTIPART_MAX_PARTS):
+            data = part * n + b"--1234--"
+            with self.assertRaises(HTTPInputError):
+                parse_multipart_form_data(b"1234", data, {}, {})
+
     def test_part_headers_too_large(self):
         # CVE-2026-31958: an enormous per-part header block must be rejected.
         big_header = b"X-Bad: " + b"a" * (_MULTIPART_MAX_PART_HEADER_SIZE + 1)
@@ -288,38 +332,65 @@ Foo
         self.assertEqual(file["filename"], "ab.txt")
         self.assertEqual(file["body"], b"Foo")
 
+    def test_disposition_param_linear_performance(self):
+        # This is a regression test for performance of parsing parameters
+        # to the content-disposition header, specifically for semicolons within
+        # quoted strings.
+        #
+        # Upstream drives this through parse_multipart_form_data, but here the
+        # 10KB part-header cap (CVE-2026-31958) keeps that input too small to
+        # show the quadratic cost. _parse_header is also reached from
+        # Sec-WebSocket-Extensions, bounded only by max_header_size, so test
+        # it directly.
+        def once(n):
+            start = time.time()
+            disposition, params = _parse_header(
+                'form-data; x="' + ";" * n + '"; name="files"; filename="a.txt"')
+            self.assertEqual(params["filename"], "a.txt")
+            return time.time() - start
+
+        def f(n):
+            # Best of three with the collector off, as in
+            # HTTPHeadersTest.test_linear_performance.
+            gc.disable()
+            try:
+                return min(once(n) for _ in range(3))
+            finally:
+                gc.enable()
+
+        d1 = f(1000)
+        d2 = f(10000)
+        if d2 / d1 > 20:
+            self.fail("Disposition param parsing is not linear: d1=%r vs d2=%r"
+                      % (d1, d2))
+
 
 class HTTPHeadersTest(unittest.TestCase):
-    def test_multi_line(self):
-        # Lines beginning with whitespace are appended to the previous line
-        # with any leading whitespace replaced by a single space.
-        # Note that while multi-line headers are a part of the HTTP spec,
-        # their use is strongly discouraged.
-        data = """\
-Foo: bar
- baz
-Asdf: qwer
-\tzxcv
-Foo: even
-     more
-     lines
-""".replace("\n", "\r\n")
-        headers = HTTPHeaders.parse(data)
-        self.assertEqual(headers["asdf"], "qwer zxcv")
-        self.assertEqual(headers.get_list("asdf"), ["qwer zxcv"])
-        self.assertEqual(headers["Foo"], "bar baz,even more lines")
-        self.assertEqual(headers.get_list("foo"), ["bar baz", "even more lines"])
-        self.assertEqual(sorted(list(headers.get_all())),
-                         [("Asdf", "qwer zxcv"),
-                          ("Foo", "bar baz"),
-                          ("Foo", "even more lines")])
+    def test_folding_rejected(self):
+        # GHSA-pcg2-g6cj-q92c: folded continuation lines are not supported.
+        for data in ["Foo: bar\r\n\tasdf", "Foo: bar\r\n baz",
+                     # A continuation line with nothing to continue.
+                     " Foo: bar",
+                     # \f (formfeed) is whitespace according to str.isspace,
+                     # but not according to the HTTP spec.
+                     "Foo: bar\r\n\fasdf"]:
+            with self.assertRaises(HTTPInputError):
+                HTTPHeaders.parse(data)
 
-    def test_malformed_continuation(self):
-        # If the first line starts with whitespace, it's a
-        # continuation line with nothing to continue, so reject it
-        # (with a proper error).
-        data = " Foo: bar"
-        self.assertRaises(HTTPInputError, HTTPHeaders.parse, data)
+    def test_folding_rejected_quickly(self):
+        # The header block in the advisory: one header followed by a very
+        # large number of short continuation lines. Appending each one used
+        # to take quadratic time; now the first is rejected.
+        data = "Foo: bar\r\n" + " x\r\n" * 200000
+        start = time.time()
+        with self.assertRaises(HTTPInputError):
+            HTTPHeaders.parse(data)
+        self.assertLess(time.time() - start, 1.0)
+
+    def test_contains_case_insensitive(self):
+        headers = HTTPHeaders.parse("Asdf: qwer\r\n")
+        self.assertTrue("asdf" in headers)
+        self.assertTrue("Asdf" in headers)
 
     def test_optional_whitespace_stripping(self):
         # GHSA-753j-mpmx-qq6g: only spaces and tabs (RFC 7230 OWS) are
@@ -432,6 +503,31 @@ Foo: even
         headers2 = HTTPHeaders.parse(str(headers))
         self.assertEquals(headers, headers2)
 
+    def test_linear_performance(self):
+        def once(n):
+            start = time.time()
+            headers = HTTPHeaders()
+            for i in range(n):
+                headers.add("X-Foo", "bar")
+            return time.time() - start
+
+        def f(n):
+            # Best of three with the collector off: on Python 2 a GC pass
+            # during the short run can skew the ratio past the margin.
+            gc.disable()
+            try:
+                return min(once(n) for _ in range(3))
+            finally:
+                gc.enable()
+
+        # This runs under 50ms on my laptop as of 2025-12-09.
+        d1 = f(10000)
+        d2 = f(100000)
+        if d2 / d1 > 20:
+            # d2 should be about 10x d1 but allow a wide margin for variability.
+            self.fail("HTTPHeaders.add() does not scale linearly: d1=%r vs d2=%r"
+                      % (d1, d2))
+
 
 class FormatTimestampTest(unittest.TestCase):
     # Make sure that all the input types are supported.
@@ -475,6 +571,20 @@ class HTTPServerRequestTest(unittest.TestCase):
     def test_repr_does_not_contain_headers(self):
         request = HTTPServerRequest(uri='/', headers={'Canary': 'Coal Mine'})
         self.assertTrue('Canary' not in repr(request))
+
+    def test_query_arguments_within_limit(self):
+        n = _URLENCODED_MAX_ARGUMENTS
+        request = HTTPServerRequest(uri="/?" + "&".join("a=%d" % i for i in range(n)))
+        self.assertEqual(len(request.arguments["a"]), n)
+
+    def test_max_query_arguments(self):
+        # GHSA-3hv7-mjh2-fv65: the query string is subject to the same limit
+        # on the number of arguments as a urlencoded body: parsing is
+        # superlinear enough in the number of fields to be worth bounding.
+        n = _URLENCODED_MAX_ARGUMENTS + 1
+        with self.assertRaises(HTTPInputError) as cm:
+            HTTPServerRequest(uri="/?" + "&".join("a=%d" % i for i in range(n)))
+        self.assertIn("Max number of fields exceeded", str(cm.exception))
 
 
 class ParseRequestStartLineTest(unittest.TestCase):
