@@ -580,6 +580,20 @@ class HTTPServerRequestTest(unittest.TestCase):
         request = HTTPServerRequest(uri='/', headers={'Canary': 'Coal Mine'})
         self.assertTrue('Canary' not in repr(request))
 
+    def test_query_arguments_within_limit(self):
+        n = _URLENCODED_MAX_ARGUMENTS
+        request = HTTPServerRequest(uri="/?" + "&".join("a=%d" % i for i in range(n)))
+        self.assertEqual(len(request.arguments["a"]), n)
+
+    def test_max_query_arguments(self):
+        # GHSA-3hv7-mjh2-fv65: the query string is subject to the same limit
+        # on the number of arguments as a urlencoded body: parsing is
+        # superlinear enough in the number of fields to be worth bounding.
+        n = _URLENCODED_MAX_ARGUMENTS + 1
+        with self.assertRaises(HTTPInputError) as cm:
+            HTTPServerRequest(uri="/?" + "&".join("a=%d" % i for i in range(n)))
+        self.assertIn("Max number of fields exceeded", str(cm.exception))
+
 
 class ParseRequestStartLineTest(unittest.TestCase):
     METHOD = "GET"

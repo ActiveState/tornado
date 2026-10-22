@@ -410,6 +410,16 @@ class HTTPServerRawTest(AsyncHTTPTestCase):
             self.assertEqual(400, start_line.code)
             self.assertEqual('Bad Request', start_line.reason)
 
+    def test_too_many_query_arguments(self):
+        # GHSA-3hv7-mjh2-fv65: an over-limit query string is a malformed
+        # request (400), rejected before any handler runs.
+        query = "&".join("a=%d" % i for i in range(1001))
+        with ExpectLog(gen_log, '.*Max number of fields exceeded'):
+            self.stream.write(utf8('GET /echo?%s HTTP/1.1\r\n\r\n' % query))
+            read_stream_body(self.stream, self.stop)
+            start_line, headers, response = self.wait()
+            self.assertEqual(400, start_line.code)
+
     def test_malformed_first_line_log(self):
         with ExpectLog(gen_log, '.*Malformed HTTP request line'):
             self.stream.write(b'asdf\r\n\r\n')

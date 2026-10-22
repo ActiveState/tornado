@@ -408,7 +408,17 @@ class HTTPServerRequest(object):
         self._finish_time = None
 
         self.path, sep, self.query = uri.partition('?')
-        self.arguments = parse_qs_bytes(self.query, keep_blank_values=True)
+        try:
+            self.arguments = parse_qs_bytes(
+                self.query,
+                keep_blank_values=True,
+                # The query string is bounded by max_header_size, but parsing
+                # is expensive enough per field to be worth limiting. Use the
+                # same limit as a urlencoded body (GHSA-3hv7-mjh2-fv65).
+                max_num_fields=_URLENCODED_MAX_ARGUMENTS,
+            )
+        except Exception as e:
+            raise HTTPInputError("Invalid query string: %s" % e)
         self.query_arguments = copy.deepcopy(self.arguments)
         self.body_arguments = {}
 
