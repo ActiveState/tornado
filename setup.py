@@ -172,6 +172,8 @@ setup(
             "templates/utf8.html",
             "test.crt",
             "test.key",
+            "client_cert.crt",
+            "client_cert.key",
         ],
     },
     author="Facebook",
