@@ -665,7 +665,15 @@ class CurlAsyncHTTPClient(AsyncHTTPClient):
                 return
         if not header_line:
             return
-        headers.parse_line(header_line)
+        try:
+            headers.parse_line(header_line)
+        except httputil.HTTPInputError as e:
+            # libcurl hands over each header line as received, including a
+            # folded continuation line, which HTTPHeaders no longer accepts
+            # (GHSA-pcg2-g6cj-q92c). Fail the transfer: a short count from a
+            # header callback makes libcurl abort it.
+            curl_log.info("Malformed HTTP message: %s", e)
+            return 0
 
     def _curl_debug(self, debug_type, debug_msg):
         debug_types = ('I', '<', '>', '<', '>')

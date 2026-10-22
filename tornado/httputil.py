@@ -154,7 +154,6 @@ class HTTPHeaders(collections.MutableMapping):
         # repeated header lines linear rather than quadratic (CVE-2025-67725).
         self._as_list = {}  # type: typing.Dict[str, typing.List[str]]
         self._combined_cache = {}  # type: typing.Dict[str, str]
-        self._last_key = None
         if (len(args) == 1 and len(kwargs) == 0 and
                 isinstance(args[0], HTTPHeaders)):
             # Copy constructor
@@ -170,7 +169,6 @@ class HTTPHeaders(collections.MutableMapping):
         # type: (str, str) -> None
         """Adds a new value for the given key."""
         norm_name = _normalized_headers[name]
-        self._last_key = norm_name
         if norm_name in self:
             self._combined_cache.pop(norm_name, None)
             self._as_list[norm_name].append(value)
@@ -200,20 +198,22 @@ class HTTPHeaders(collections.MutableMapping):
         >>> h.parse_line("Content-Type: text/html")
         >>> h.get('content-type')
         'text/html'
+
+        .. versionchanged:: 5.1.1.post3
+           Obsolete line folding (a header line beginning with whitespace,
+           continuing the previous one) is no longer supported and raises
+           `HTTPInputError`. Appending each continuation took quadratic time
+           (GHSA-pcg2-g6cj-q92c); RFC 7230 section 3.2.4 allows rejecting
+           obs-fold, and tornado 6.6 removed it the same way.
         """
         if line[0].isspace():
-            # continuation of a multi-line header
-            if self._last_key is None:
-                raise HTTPInputError("first header line cannot start with whitespace")
-            new_part = ' ' + line.lstrip(HTTP_WHITESPACE)
-            self._as_list[self._last_key][-1] += new_part
-            self._combined_cache.pop(self._last_key, None)
-        else:
-            try:
-                name, value = line.split(":", 1)
-            except ValueError:
-                raise HTTPInputError("no colon in header line")
-            self.add(name, value.strip(HTTP_WHITESPACE))
+            raise HTTPInputError(
+                "header line cannot start with whitespace, folding not supported")
+        try:
+            name, value = line.split(":", 1)
+        except ValueError:
+            raise HTTPInputError("no colon in header line")
+        self.add(name, value.strip(HTTP_WHITESPACE))
 
     @classmethod
     def parse(cls, headers):

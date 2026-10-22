@@ -193,6 +193,9 @@ class LargeBodyHandler(RequestHandler):
 
 
 class HTTPClientCommonTestCase(AsyncHTTPTestCase):
+    # Logger the client implementation uses to report a malformed response.
+    malformed_message_log = gen_log
+
     def get_app(self):
         return Application([
             url("/hello", HelloWorldHandler),
@@ -503,8 +506,13 @@ Transfer-Encoding: chunked
                     (resp.body, value, container))
 
     def test_multi_line_headers(self):
-        # Multi-line http headers are rare but rfc-allowed
-        # http://www.w3.org/Protocols/rfc2616/rfc2616-sec4.html#sec4.2
+        # Line folding is an obsolete way of representing headers split across multiple lines.
+        # https://tools.ietf.org/html/rfc7230#section-3.2.4
+        #
+        # The spec requires user agents to unfold them or reject the message.
+        # Both clients reject them as of 5.1.1.post3 (GHSA-pcg2-g6cj-q92c);
+        # what matters is that the client fails promptly instead of hanging
+        # until its timeout, and doesn't misparse the header.
         sock, port = bind_unused_port()
         with closing(sock):
             @gen.coroutine
@@ -522,10 +530,14 @@ X-XSS-Protection: 1;
                 stream.close()
 
             netutil.add_accept_handler(sock, accept_callback)
-            resp = self.fetch("http://127.0.0.1:%d/" % port)
-            resp.rethrow()
-            self.assertEqual(resp.headers['X-XSS-Protection'], "1; mode=block")
-            self.io_loop.remove_handler(sock.fileno())
+            try:
+                with ExpectLog(self.malformed_message_log,
+                               "Malformed HTTP message.*folding"):
+                    with self.assertRaises(HTTPError) as cm:
+                        self.fetch("http://127.0.0.1:%d/" % port, raise_error=True)
+                self.assertEqual(cm.exception.code, 599)
+            finally:
+                self.io_loop.remove_handler(sock.fileno())
 
     def test_304_with_content_length(self):
         # According to the spec 304 responses SHOULD NOT include

@@ -366,39 +366,31 @@ Foo
 
 
 class HTTPHeadersTest(unittest.TestCase):
-    def test_multi_line(self):
-        # Lines beginning with whitespace are appended to the previous line
-        # with any leading whitespace replaced by a single space.
-        # Note that while multi-line headers are a part of the HTTP spec,
-        # their use is strongly discouraged.
-        data = """\
-Foo: bar
- baz
-Asdf: qwer
-\tzxcv
-Foo: even
-     more
-     lines
-""".replace("\n", "\r\n")
-        headers = HTTPHeaders.parse(data)
-        self.assertEqual(headers["asdf"], "qwer zxcv")
-        self.assertEqual(headers.get_list("asdf"), ["qwer zxcv"])
-        self.assertEqual(headers["Foo"], "bar baz,even more lines")
-        self.assertEqual(headers.get_list("foo"), ["bar baz", "even more lines"])
-        self.assertEqual(sorted(list(headers.get_all())),
-                         [("Asdf", "qwer zxcv"),
-                          ("Foo", "bar baz"),
-                          ("Foo", "even more lines")])
-        # Verify case insensitivity in-operator
+    def test_folding_rejected(self):
+        # GHSA-pcg2-g6cj-q92c: folded continuation lines are not supported.
+        for data in ["Foo: bar\r\n\tasdf", "Foo: bar\r\n baz",
+                     # A continuation line with nothing to continue.
+                     " Foo: bar",
+                     # \f (formfeed) is whitespace according to str.isspace,
+                     # but not according to the HTTP spec.
+                     "Foo: bar\r\n\fasdf"]:
+            with self.assertRaises(HTTPInputError):
+                HTTPHeaders.parse(data)
+
+    def test_folding_rejected_quickly(self):
+        # The header block in the advisory: one header followed by a very
+        # large number of short continuation lines. Appending each one used
+        # to take quadratic time; now the first is rejected.
+        data = "Foo: bar\r\n" + " x\r\n" * 200000
+        start = time.time()
+        with self.assertRaises(HTTPInputError):
+            HTTPHeaders.parse(data)
+        self.assertLess(time.time() - start, 1.0)
+
+    def test_contains_case_insensitive(self):
+        headers = HTTPHeaders.parse("Asdf: qwer\r\n")
         self.assertTrue("asdf" in headers)
         self.assertTrue("Asdf" in headers)
-
-    def test_malformed_continuation(self):
-        # If the first line starts with whitespace, it's a
-        # continuation line with nothing to continue, so reject it
-        # (with a proper error).
-        data = " Foo: bar"
-        self.assertRaises(HTTPInputError, HTTPHeaders.parse, data)
 
     def test_optional_whitespace_stripping(self):
         # GHSA-753j-mpmx-qq6g: only spaces and tabs (RFC 7230 OWS) are

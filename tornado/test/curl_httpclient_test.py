@@ -2,6 +2,7 @@
 from __future__ import absolute_import, division, print_function
 
 import gc
+import logging
 from hashlib import md5
 import os
 import ssl
@@ -50,6 +51,8 @@ def small_streaming_buffer():
 
 @unittest.skipIf(pycurl is None, "pycurl module not present")
 class CurlHTTPClientCommonTestCase(httpclient_test.HTTPClientCommonTestCase):
+    malformed_message_log = logging.getLogger("tornado.curl_httpclient")
+
     def get_http_client(self):
         client = CurlAsyncHTTPClient(defaults=dict(allow_ipv6=False))
         # make sure AsyncHTTPClient magic doesn't give us the wrong class
