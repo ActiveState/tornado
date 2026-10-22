@@ -12,7 +12,7 @@ from io import BytesIO
 import time
 import unicodedata
 
-from tornado.escape import utf8, native_str
+from tornado.escape import utf8, native_str, json_encode, json_decode
 from tornado import gen
 from tornado.httpclient import HTTPRequest, HTTPResponse, _RequestProxy, HTTPError, HTTPClient
 from tornado.httpserver import HTTPServer
@@ -122,6 +122,11 @@ class SetHeaderHandler(RequestHandler):
                         self.request.arguments['v']):
             self.set_header(k, v)
 
+
+class EchoHeadersHandler(RequestHandler):
+    def get(self):
+        self.write(json_encode(dict(self.request.headers.get_all())))
+
 # These tests end up getting run redundantly: once here with the default
 # HTTPClient implementation, and then again in each implementation's own
 # test suite.
@@ -143,7 +148,20 @@ class HTTPClientCommonTestCase(AsyncHTTPTestCase):
             url("/all_methods", AllMethodsHandler),
             url('/patch', PatchHandler),
             url('/set_header', SetHeaderHandler),
+            url("/echo_headers", EchoHeadersHandler),
         ], gzip=True)
+
+    def setUp(self):
+        super(HTTPClientCommonTestCase, self).setUp()
+
+        # Add a second port (serving the same app) to the HTTP server, so we can test the effects
+        # of redirects that span different origins.
+        sock, port = bind_unused_port()
+        self.http_server.add_socket(sock)
+        self.__port2 = port
+
+    def get_url2(self, path):
+        return "%s://127.0.0.1:%s%s" % (self.get_protocol(), self.__port2, path)
 
     def test_patch_receives_payload(self):
         body = b"some patch data"
@@ -562,6 +580,54 @@ X-XSS-Protection: 1;
 
         for k, v in response.time_info.items():
             self.assertTrue(0 <= v < 1.0, "time_info[%s] out of bounds: %s" % (k, v))
+
+    def test_strip_headers_on_redirect(self):
+        # CVE-2026-49853: ensure that headers that should be stripped on
+        # cross-origin redirects are stripped, even if the redirect is to a
+        # different port on localhost.
+        test_cases = [
+            ("manual auth header", dict(headers={"Authorization": "secret"}), ""),
+            ("credentials in URL", dict(), "me:secret"),
+            ("auth parameters", dict(auth_username="me", auth_password="secret"), ""),
+            ("manual cookie header", dict(headers={"Cookie": "secret"}), ""),
+        ]
+        for name, kwargs, url_creds in test_cases:
+            for origin, target in (("different", self.get_url2), ("same", self.get_url)):
+                msg = "%s, %s origin" % (name, origin)
+                url = self.get_url(
+                    "/redirect?url=%s&status=302" % target("/echo_headers"))
+                if url_creds:
+                    url = url.replace("http://", "http://%s@" % url_creds)
+                response = self.fetch(url, **kwargs)
+                response.rethrow()
+                echoed_headers = json_decode(response.body)
+                # Confirm that non-auth headers are getting through.
+                # (Upstream checks User-Agent, which 5.1.1's simple client
+                # does not send by default.)
+                self.assertIn("Host", echoed_headers, msg)
+                if origin == "different":
+                    # Auth headers are stripped, however they were set.
+                    self.assertNotIn("Authorization", echoed_headers, msg)
+                    self.assertNotIn("Cookie", echoed_headers, msg)
+                else:
+                    # Auth headers are not stripped when the redirect is
+                    # same-origin. Each of our tests uses one of these
+                    # headers, but not both.
+                    self.assertTrue(
+                        "Authorization" in echoed_headers or "Cookie" in echoed_headers,
+                        msg)
+
+    def test_redirect_does_not_modify_original_headers(self):
+        # The redirected request is a shallow copy of the original, so
+        # stripping auth headers for a cross-origin redirect must happen on
+        # a copy of the headers, not on the caller's request.
+        request = HTTPRequest(
+            self.get_url("/redirect?url=%s&status=302" % self.get_url2("/echo_headers")),
+            headers={"Authorization": "secret"})
+        response = self.io_loop.run_sync(
+            lambda: self.http_client.fetch(request, raise_error=False))
+        response.rethrow()
+        self.assertEqual(request.headers.get("Authorization"), "secret")
 
 
 class RequestProxyTest(unittest.TestCase):
