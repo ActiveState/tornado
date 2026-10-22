@@ -10,6 +10,7 @@ import re
 import socket
 import ssl
 import sys
+from io import BytesIO
 
 from tornado.escape import to_unicode, utf8
 from tornado import gen
@@ -709,8 +710,20 @@ class MaxBodySizeTest(AsyncHTTPTestCase):
             def get(self):
                 self.write("a" * 1024 * 100)
 
+        class GzipBomb(RequestHandler):
+            def get(self):
+                # Well under max_body_size on the wire, over it once
+                # decompressed.
+                bytesio = BytesIO()
+                gzip_file = gzip.GzipFile(mode='w', fileobj=bytesio)
+                gzip_file.write(b"a" * 1024 * 100)
+                gzip_file.close()
+                self.set_header("Content-Encoding", "gzip")
+                self.write(bytesio.getvalue())
+
         return Application([('/small', SmallBody),
-                            ('/large', LargeBody)])
+                            ('/large', LargeBody),
+                            ('/gzip_bomb', GzipBomb)])
 
     def get_http_client(self):
         return SimpleAsyncHTTPClient(max_body_size=1024 * 64)
@@ -724,6 +737,12 @@ class MaxBodySizeTest(AsyncHTTPTestCase):
         with ExpectLog(gen_log, "Malformed HTTP message from None: Content-Length too long"):
             with self.assertRaises(HTTPStreamClosedError):
                 self.fetch('/large', raise_error=True)
+
+    def test_decompressed_body_too_large(self):
+        # CVE-2026-49855: max_body_size applies to the decompressed size.
+        with ExpectLog(gen_log, "Malformed HTTP message from None: decompressed body too large"):
+            with self.assertRaises(HTTPStreamClosedError):
+                self.fetch('/gzip_bomb', raise_error=True)
 
 
 class MaxBufferSizeTest(AsyncHTTPTestCase):
