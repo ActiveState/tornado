@@ -945,19 +945,29 @@ def parse_response_start_line(line):
 # It has also been modified to support valueless parameters as seen in
 # websocket extension negotiations, and to support non-ascii values in
 # RFC 2231/5987 format.
+#
+# _parseparam has been further modified with the logic from
+# https://github.com/python/cpython/pull/136072/files
+# to avoid quadratic behavior when parsing semicolons in quoted strings
+# (CVE-2025-67726).
 
 
 def _parseparam(s):
-    while s[:1] == ';':
-        s = s[1:]
-        end = s.find(';')
-        while end > 0 and (s.count('"', 0, end) - s.count('\\"', 0, end)) % 2:
-            end = s.find(';', end + 1)
+    start = 0
+    while s.find(';', start) == start:
+        start += 1
+        end = s.find(';', start)
+        ind, diff = start, 0
+        while end > 0:
+            diff += s.count('"', ind, end) - s.count('\\"', ind, end)
+            if diff % 2 == 0:
+                break
+            end, ind = ind, s.find(';', end + 1)
         if end < 0:
             end = len(s)
-        f = s[:end]
+        f = s[start:end]
         yield f.strip()
-        s = s[end:]
+        start = end
 
 
 def _parse_header(line):

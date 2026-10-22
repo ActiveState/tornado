@@ -5,6 +5,7 @@ from tornado.httputil import (
     url_concat, parse_multipart_form_data, HTTPHeaders, format_timestamp,
     HTTPServerRequest, parse_request_start_line, parse_cookie, qs_to_qsl,
     HTTPInputError, _MULTIPART_MAX_PARTS, _MULTIPART_MAX_PART_HEADER_SIZE,
+    _parse_header,
 )
 from tornado.escape import utf8, native_str
 from tornado.util import PY3
@@ -288,6 +289,38 @@ Foo
         file = files["files"][0]
         self.assertEqual(file["filename"], "ab.txt")
         self.assertEqual(file["body"], b"Foo")
+
+    def test_disposition_param_linear_performance(self):
+        # This is a regression test for performance of parsing parameters
+        # to the content-disposition header, specifically for semicolons within
+        # quoted strings.
+        #
+        # Upstream drives this through parse_multipart_form_data, but here the
+        # 10KB part-header cap (CVE-2026-31958) keeps that input too small to
+        # show the quadratic cost. _parse_header is also reached from
+        # Sec-WebSocket-Extensions, bounded only by max_header_size, so test
+        # it directly.
+        def once(n):
+            start = time.time()
+            disposition, params = _parse_header(
+                'form-data; x="' + ";" * n + '"; name="files"; filename="a.txt"')
+            self.assertEqual(params["filename"], "a.txt")
+            return time.time() - start
+
+        def f(n):
+            # Best of three with the collector off, as in
+            # HTTPHeadersTest.test_linear_performance.
+            gc.disable()
+            try:
+                return min(once(n) for _ in range(3))
+            finally:
+                gc.enable()
+
+        d1 = f(1000)
+        d2 = f(10000)
+        if d2 / d1 > 20:
+            self.fail("Disposition param parsing is not linear: d1=%r vs d2=%r"
+                      % (d1, d2))
 
 
 class HTTPHeadersTest(unittest.TestCase):
