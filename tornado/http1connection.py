@@ -104,6 +104,9 @@ class _ExceptionLoggingContext(object):
 
     def __exit__(self, typ, value, tb):
         if value is not None:
+            # Let HTTPInputError pass through to higher-level handler
+            if isinstance(value, httputil.HTTPInputError):
+                return None
             self.logger.error("Uncaught exception", exc_info=(typ, value, tb))
             raise _QuietException
 

@@ -256,7 +256,8 @@ class _RoutingDelegate(httputil.HTTPMessageDelegate):
         self.delegate.finish()
 
     def on_connection_close(self):
-        self.delegate.on_connection_close()
+        if self.delegate is not None:
+            self.delegate.on_connection_close()
 
 
 class _DefaultMessageDelegate(httputil.HTTPMessageDelegate):
