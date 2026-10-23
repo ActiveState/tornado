@@ -332,6 +332,19 @@ Foo
         self.assertEqual(file["filename"], "ab.txt")
         self.assertEqual(file["body"], b"Foo")
 
+    def test_valueless_parameters(self):
+        # Parameters without a value (websocket extension negotiation) map
+        # to None; one given with a value takes precedence.
+        self.assertEqual(
+            _parse_header("permessage-deflate; server_no_context_takeover; "
+                          "client_max_window_bits"),
+            ("permessage-deflate", {"server_no_context_takeover": None,
+                                    "client_max_window_bits": None}))
+        self.assertEqual(
+            _parse_header("permessage-deflate; client_max_window_bits; "
+                          "client_max_window_bits=10"),
+            ("permessage-deflate", {"client_max_window_bits": "10"}))
+
     def test_disposition_param_linear_performance(self):
         # This is a regression test for performance of parsing parameters
         # to the content-disposition header, specifically for semicolons within

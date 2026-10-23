@@ -21,6 +21,7 @@
 from __future__ import absolute_import, division, print_function
 
 import re
+import zlib
 import warnings
 
 from tornado.concurrent import (Future, future_add_done_callback,
@@ -813,8 +814,11 @@ class _GzipMessageDelegate(httputil.HTTPMessageDelegate):
         if self._decompressor:
             compressed_data = chunk
             while compressed_data:
-                decompressed = self._decompressor.decompress(
-                    compressed_data, self._chunk_size)
+                try:
+                    decompressed = self._decompressor.decompress(
+                        compressed_data, self._chunk_size)
+                except zlib.error as e:
+                    raise httputil.HTTPInputError("invalid gzip data: %s" % e)
                 if decompressed:
                     self._decompressed_body_size += len(decompressed)
                     if self._decompressed_body_size > self._max_body_size:
@@ -822,7 +826,14 @@ class _GzipMessageDelegate(httputil.HTTPMessageDelegate):
                     ret = self._delegate.data_received(decompressed)
                     if ret is not None:
                         yield ret
-                compressed_data = self._decompressor.unconsumed_tail
+                tail = self._decompressor.unconsumed_tail
+                # A call that finishes a gzip member may return no output,
+                # but it must consume some input; otherwise this loop would
+                # spin forever without yielding to the IOLoop.
+                if not decompressed and len(tail) >= len(compressed_data):
+                    raise httputil.HTTPInputError(
+                        "encountered unconsumed gzip data without making progress")
+                compressed_data = tail
         else:
             ret = self._delegate.data_received(chunk)
             if ret is not None:
@@ -830,14 +841,17 @@ class _GzipMessageDelegate(httputil.HTTPMessageDelegate):
 
     def finish(self):
         if self._decompressor is not None:
-            tail = self._decompressor.flush()
-            if tail:
-                # I believe the tail will always be empty (i.e.
-                # decompress will return all it can).  The purpose
-                # of the flush call is to detect errors such
-                # as truncated input.  But in case it ever returns
-                # anything, treat it as an extra chunk
-                self._delegate.data_received(tail)
+            try:
+                # data_received has passed all the data to decompress, so
+                # this returns nothing; it checks for truncated input.
+                self._decompressor.flush()
+            except zlib.error as e:
+                # The wrapped delegate will never see finish(), and since this
+                # delegate has been finished, HTTP1Connection will not call
+                # our on_connection_close either. Close the wrapped delegate
+                # here so it gets exactly one of the two.
+                self._delegate.on_connection_close()
+                raise httputil.HTTPInputError("invalid gzip data: %s" % e)
         return self._delegate.finish()
 
     def on_connection_close(self):

@@ -28,6 +28,7 @@ from tornado.test import httpclient_test
 from tornado.testing import (AsyncHTTPTestCase, AsyncHTTPSTestCase, AsyncTestCase,
                              ExpectLog, gen_test)
 from tornado.test.util import skipOnTravis, skipIfNoIPv6, refusing_port, skipBefore35, exec_test
+from tornado.test.util import gzip_compress, random_bytes
 from tornado.web import RequestHandler, Application, url, stream_request_body
 
 
@@ -630,6 +631,64 @@ class HTTP1xxLimitTestCase(AsyncHTTPTestCase):
                        "Malformed HTTP message from None: Too many 1xx responses"):
             with self.assertRaises(HTTPStreamClosedError):
                 self.fetch("/?num=5000", raise_error=True)
+
+def gzip_members():
+    # Each member is bigger than the connection's chunk_size (64KB), so that
+    # decompression goes through the max_length path of _GzipMessageDelegate.
+    # The first is incompressible, but seeded so that the handler and the
+    # test generate the same bytes without keeping them around.
+    return [random_bytes(100000), b"hello " * 20000]
+
+
+class GzipResponseHandler(RequestHandler):
+    def body(self, kind):
+        if kind == "reviewer":
+            # 70KB random + 200KB of "x", then trailing bytes.
+            return (gzip_compress(random_bytes(70000) + b"x" * 200000) +
+                    b"TRAILING-GARBAGE")
+        body = b"".join(gzip_compress(m) for m in gzip_members())
+        if kind == "truncated":
+            return body[:-1]
+        trailers = {
+            "concatenated": b"",
+            "trailing_nul": b"\0",
+            "trailing_garbage": b"garbage",
+        }
+        return body + trailers[kind]
+
+    def get(self, kind):
+        # Set Content-Encoding manually to avoid automatic gzip encoding.
+        self.set_header("Content-Encoding", "gzip")
+        self.write(self.body(kind))
+
+    def head(self, kind):
+        self.set_header("Content-Encoding", "gzip")
+        self.set_header("Content-Length", str(len(self.body(kind))))
+
+
+class GzipResponseTestCase(AsyncHTTPTestCase):
+    def get_http_client(self):
+        return SimpleAsyncHTTPClient(force_instance=True)
+
+    def get_app(self):
+        return Application([url("/(.*)", GzipResponseHandler)])
+
+    def test_concatenated(self):
+        response = self.fetch("/concatenated")
+        self.assertEqual(response.body, b"".join(gzip_members()))
+
+    def test_head(self):
+        response = self.fetch("/concatenated", method="HEAD")
+        self.assertEqual(response.code, 200)
+        self.assertEqual(response.body, b"")
+
+    def test_invalid(self):
+        for kind in ["trailing_nul", "trailing_garbage", "truncated", "reviewer"]:
+            with ExpectLog(gen_log,
+                           "Malformed HTTP message from None: invalid gzip data"):
+                with self.assertRaises(HTTPStreamClosedError):
+                    self.fetch("/" + kind, raise_error=True)
+
 
 class HTTP204NoContentTestCase(AsyncHTTPTestCase):
     def respond_204(self, request):

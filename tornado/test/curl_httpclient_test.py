@@ -52,6 +52,11 @@ def small_streaming_buffer():
 @unittest.skipIf(pycurl is None, "pycurl module not present")
 class CurlHTTPClientCommonTestCase(httpclient_test.HTTPClientCommonTestCase):
     malformed_message_log = logging.getLogger("tornado.curl_httpclient")
+    # CurlAsyncHTTPClient leaves cross-origin redirects to libcurl, which
+    # only drops credentials on a redirect to the same host on a different
+    # port from 7.83.0 (CVE-2022-27776).
+    strips_credentials_on_port_change = (
+        pycurl is not None and pycurl.version_info()[2] >= 0x075300)
 
     def get_http_client(self):
         client = CurlAsyncHTTPClient(defaults=dict(allow_ipv6=False))
