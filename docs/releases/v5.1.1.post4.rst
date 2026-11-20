@@ -1,0 +1,29 @@
+What's new in Tornado 5.1.1.post4
+=================================
+
+Nov 20, 2026
+------------
+
+This is a Python 2 compatible patch release backporting security fixes
+from Tornado 6.6.1. It is cumulative: it contains every fix in
+5.1.1.post3.
+
+Security fixes
+~~~~~~~~~~~~~~
+
+- **CVE-2026-126347** -- fixed. ``RedirectHandler`` treats three or more
+  leading slashes (``///example.com``) as a change of host, as browsers
+  do, so a substituted path argument can no longer redirect to another
+  site. The expected scheme and netloc now come from the part of ``url``
+  before the first substitution, which also lets templates like
+  ``"/{0}.html"`` work again. Templates whose host would come entirely from
+  a substitution (``"https://{0}"``) are rejected, and redirect URLs with
+  control characters get a 400 instead of a 500.
+
+Other security fixes
+~~~~~~~~~~~~~~~~~~~~
+
+- The ``addslash`` and ``removeslash`` decorators no longer redirect a
+  path that starts with two or more slashes (``//example.com``), which
+  browsers treat as another host. Such requests get a 403. Backport of a
+  Tornado 6.6.1 fix that has no CVE or advisory.
