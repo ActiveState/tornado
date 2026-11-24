@@ -3325,6 +3325,9 @@ class DecoratorTest(WebTestCase):
 
         return [("/removeslash/", RemoveSlashHandler),
                 ("/addslash", AddSlashHandler),
+                # Catch-all routes can see paths that start with two slashes.
+                (r"/+rem.*", RemoveSlashHandler),
+                (r"/+add.*", AddSlashHandler),
                 ]
 
     def test_removeslash(self):
@@ -3344,6 +3347,19 @@ class DecoratorTest(WebTestCase):
         response = self.fetch("/addslash?foo=bar", follow_redirects=False)
         self.assertEqual(response.code, 301)
         self.assertEqual(response.headers['Location'], "/addslash/?foo=bar")
+
+    def test_no_protocol_relative_redirect(self):
+        # Redirecting to //example.com would be an open redirect.
+        for path in [
+            "//add.example.com",
+            "///add.example.com",
+            "//rem.example.com/",
+            "//rem.example.com//",
+            "///rem.example.com/x/",
+        ]:
+            with ExpectLog(gen_log, ".*cannot redirect path"):
+                response = self.fetch(path, follow_redirects=False)
+            self.assertEqual(response.code, 403, path)
 
 
 @wsgi_safe
@@ -3479,6 +3495,9 @@ class RedirectHandlerTest(WebTestCase):
             ('/src2', WebRedirectHandler, {'url': '/dst2?foo=bar'}),
             (r'/any/(.*)', WebRedirectHandler, {'url': '{0}'}),
             (r'/moved(.*)', WebRedirectHandler, {'url': 'https://example.com{0}'}),
+            (r'/(.*)/target', WebRedirectHandler, {'url': '/{0}/destination'}),
+            (r'/hostless/(.*)', WebRedirectHandler, {'url': 'https://{0}'}),
+            (r'/schemeonly/(.*)', WebRedirectHandler, {'url': 'https:{0}'}),
             (r'/(.*?)/(.*?)/(.*)', WebRedirectHandler, {'url': '/{1}/{0}/{2}'})]
 
     def test_basic_redirect(self):
@@ -3520,7 +3539,55 @@ class RedirectHandlerTest(WebTestCase):
         # Browsers treat backslashes like slashes and ignore tabs and newlines,
         # so these variants are also protocol-relative. Path arguments are
         # url-decoded, so they can be smuggled in with percent-encoding.
-        for path in ["/a/%5Cexample.com/b", "/a/%09/example.com/b"]:
+        # Browsers also skip any number of slashes before the host, so three
+        # or more slashes are just as protocol-relative as two
+        # (CVE-2026-126347).
+        for path in [
+            "/a/%5Cexample.com/b",
+            "/a/%09/example.com/b",
+            "/a///example.com/b",
+            "/a////example.com/b",
+            "/a/%2F%2F%5Cexample.com/b",
+        ]:
+            self.assert_rejected(path)
+
+    def test_substitution_after_first_slash(self):
+        # The substitution comes right after the first slash, so it can add a
+        # second slash (or more) but that must not reject ordinary values.
+        for path, location in [
+            ("/ok/target", "/ok/destination"),
+            ("/a/b/target", "/a/b/destination"),
+            ("/ok/target?x=1", "/ok/destination?x=1"),
+        ]:
+            response = self.fetch(path, follow_redirects=False)
+            self.assertEqual(response.code, 301, path)
+            self.assertEqual(response.headers["Location"], location)
+        for path in [
+            "/%2Fevil.com/target",
+            "/%2F%2Fevil.com/target",
+            "/%5C%5Cevil.com/target",
+            "/%09//evil.com/target",
+            "/%2Fevil.com/target?x=1",
+        ]:
+            self.assert_rejected(path)
+
+    def test_invalid_characters(self):
+        # These would otherwise be a 500 error from set_header.
+        for path in ["/any/%0Afoo", "/any/a%00b"]:
+            with ExpectLog(gen_log, ".*Redirect URL (contains invalid|cannot)"):
+                response = self.fetch(path, follow_redirects=False)
+            self.assertEqual(response.code, 400, path)
+
+    def test_substitution_in_host(self):
+        # Substitutions cannot supply the host, even with extra slashes
+        # (which urlsplit and browsers disagree about) or a query string.
+        for path in [
+            "/hostless/evil.com",
+            "/hostless//evil.com",
+            "/schemeonly/evil.com",
+            "/schemeonly/evil.com?x=1",
+            "/schemeonly////evil.com",
+        ]:
             self.assert_rejected(path)
 
     def test_redirect_cannot_change_host(self):
@@ -3539,6 +3606,7 @@ class RedirectHandlerTest(WebTestCase):
         for path in [
             "/any/https://evil.com/",
             "/any/%5C%5Cevil.com/",
+            "/any////evil.com/",
             "/any/javascript:alert(1)",
         ]:
             self.assert_rejected(path)

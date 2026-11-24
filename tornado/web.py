@@ -73,6 +73,7 @@ import numbers
 import os.path
 import re
 import stat
+import string
 import sys
 import threading
 import time
@@ -1871,6 +1872,11 @@ def removeslash(method):
         if self.request.path.endswith("/"):
             if self.request.method in ("GET", "HEAD"):
                 uri = self.request.path.rstrip("/")
+                if _is_protocol_relative(uri):
+                    # A path like //example.com// would otherwise redirect
+                    # to another host.
+                    raise HTTPError(
+                        403, "cannot redirect path with two initial slashes")
                 if uri:  # don't try to redirect '/' to ''
                     if self.request.query:
                         uri += "?" + self.request.query
@@ -1894,6 +1900,11 @@ def addslash(method):
         if not self.request.path.endswith("/"):
             if self.request.method in ("GET", "HEAD"):
                 uri = self.request.path + "/"
+                if _is_protocol_relative(uri):
+                    # A path like //example.com would otherwise redirect to
+                    # another host.
+                    raise HTTPError(
+                        403, "cannot redirect path with two initial slashes")
                 if self.request.query:
                     uri += "?" + self.request.query
                 self.redirect(uri, permanent=True)
@@ -2417,6 +2428,13 @@ class RedirectHandler(RequestHandler):
        ``//example.com/b`` (a protocol-relative URL pointing to another host)
        now fails with a 400 error. As a consequence, substitutions cannot be
        used in the scheme or netloc part of the ``url``.
+
+    .. versionchanged:: 5.1.1.post4
+       Three or more leading slashes (``///example.com``) are also treated as
+       a change of host, as browsers do. The expected scheme and netloc now
+       come from the part of ``url`` before the first substitution, so
+       templates like ``"/{0}.html"`` work, and templates whose host would
+       come entirely from a substitution (``"https://{0}"``) are rejected.
     """
     def initialize(self, url, permanent=True):
         self._url = url
@@ -2425,19 +2443,38 @@ class RedirectHandler(RequestHandler):
     def get(self, *args):
         to_url = self._url.format(*args)
         # GHSA-pw9p-v7r6-gx4p: the scheme and netloc of the redirect must come
-        # from the template, not from the request. Find out what they are by
-        # formatting the template with a placeholder that cannot extend a
-        # scheme or netloc.
-        expected_url = self._url.format(*("/" for _ in args))
+        # from the template, not from the request. Find out what they are from
+        # the part of the template before the first substitution. (Formatting
+        # the whole template with a placeholder doesn't work: whatever the
+        # placeholder is, it can turn the template into a URL with a different
+        # netloc, as "/" does for "/{0}/b".)
+        prefix = ""
+        has_substitution = False
+        for literal, field, _, _ in string.Formatter().parse(self._url):
+            prefix += literal
+            if field is not None:
+                has_substitution = True
+                break
         try:
-            unchanged = _scheme_and_netloc(to_url) == _scheme_and_netloc(expected_url)
+            if self.request.query_arguments:
+                # Query arguments are added before the check because url_concat
+                # can change the rest of the URL.
+                to_url = httputil.url_concat(
+                    to_url, list(httputil.qs_to_qsl(self.request.query_arguments)))
+            scheme, netloc = _scheme_and_netloc(prefix)
+            unchanged = _scheme_and_netloc(to_url) == (scheme, netloc)
+            if has_substitution and scheme in ("http", "https") and not netloc:
+                # The host would come entirely from a substitution (or a
+                # browser would find one where urlsplit doesn't, as in
+                # "https:///host").
+                unchanged = False
         except ValueError:
             unchanged = False
         if not unchanged:
             raise HTTPError(400, "Redirect URL cannot change the scheme or netloc")
-        if self.request.query_arguments:
-            to_url = httputil.url_concat(
-                to_url, list(httputil.qs_to_qsl(self.request.query_arguments)))
+        if RequestHandler._INVALID_HEADER_CHAR_RE.search(to_url):
+            # Let this be a 400 rather than a 500 from set_header.
+            raise HTTPError(400, "Redirect URL contains invalid characters")
         self.redirect(to_url, permanent=self._permanent)
 
 
@@ -3713,5 +3750,10 @@ def _scheme_and_netloc(url):
     Both are empty for a relative URL. Raises `ValueError` for some malformed
     URLs.
     """
-    parts = urlparse.urlsplit(_normalize_url_like_browser(url))
+    url = _normalize_url_like_browser(url)
+    # urlsplit follows RFC 3986, in which "///example.com" has an empty netloc,
+    # but browsers resolving it against an http or https URL skip any number of
+    # slashes before the host. Collapse them so urlsplit sees the same host.
+    url = re.sub(r"^//+", "//", url)
+    parts = urlparse.urlsplit(url)
     return parts.scheme.lower(), parts.netloc.lower()
